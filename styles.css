@@ -1,0 +1,184 @@
+.opencode-sessions-view {
+  padding: 1rem;
+}
+
+.opencode-sessions-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.opencode-sessions-header h2 {
+  margin: 0;
+}
+
+.opencode-sessions-toolbar {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.opencode-sessions-filter {
+  width: 100%;
+  margin: 1rem 0 0.75rem;
+}
+
+.opencode-sessions-status {
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+}
+
+.opencode-sessions-datacore {
+  overflow-x: auto;
+}
+
+.opencode-sessions-table-wrap {
+  overflow-x: auto;
+}
+
+.opencode-sessions-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-small);
+}
+
+.opencode-sessions-table th,
+.opencode-sessions-table td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.45rem 0.55rem;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.opencode-sessions-table th {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.opencode-sessions-title {
+  color: var(--text-accent);
+  cursor: pointer;
+  min-width: 14rem;
+}
+
+.opencode-sessions-state {
+  white-space: nowrap;
+}
+
+.opencode-sessions-state-running {
+  color: var(--color-green);
+  font-weight: var(--font-bold);
+}
+
+.opencode-sessions-state-suspended {
+  color: var(--color-orange);
+}
+
+.opencode-sessions-state-idle,
+.opencode-sessions-state-none {
+  color: var(--text-faint);
+}
+
+/* Datacore card-grid view (datacorejsx) */
+.opencode-sessions-dashboard {
+  margin: 0.75rem 0;
+}
+
+.opencode-sessions-cards-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.opencode-sessions-cards-count {
+  color: var(--text-muted);
+}
+
+.opencode-sessions-cards-filter {
+  flex-grow: 1;
+  min-width: 12rem;
+}
+
+.opencode-sessions-cards {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.75rem;
+  margin: 0.75rem 0;
+  max-width: 60rem;
+}
+
+.opencode-sessions-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-primary);
+  overflow-wrap: anywhere;
+}
+
+.opencode-sessions-card-running {
+  border-color: color-mix(in srgb, var(--color-green) 45%, var(--background-modifier-border));
+}
+
+.opencode-sessions-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.opencode-sessions-card-title {
+  font-weight: var(--font-bold);
+  cursor: pointer;
+}
+
+.opencode-sessions-card-meta {
+  font-size: var(--font-smaller);
+  color: var(--text-muted);
+}
+
+.opencode-sessions-card-sub {
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+}
+
+.opencode-sessions-mono {
+  font-family: var(--font-monospace);
+}
+
+.opencode-sessions-badge {
+  flex-shrink: 0;
+  font-size: var(--font-smallest);
+  padding: 0.1rem 0.45rem;
+  border-radius: var(--radius-s);
+  white-space: nowrap;
+}
+
+.opencode-sessions-badge-running {
+  color: var(--color-green);
+  background: color-mix(in srgb, var(--color-green) 12%, transparent);
+}
+
+.opencode-sessions-badge-suspended {
+  color: var(--color-orange);
+  background: color-mix(in srgb, var(--color-orange) 12%, transparent);
+}
+
+.opencode-sessions-badge-idle,
+.opencode-sessions-badge-none {
+  color: var(--text-faint);
+  background: var(--background-modifier-hover);
+}
+
+.opencode-sessions-cards-more {
+  margin-bottom: 0.75rem;
+}
+
+.opencode-sessions-id {
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  white-space: nowrap;
+}
