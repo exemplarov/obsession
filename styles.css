@@ -246,6 +246,22 @@
   padding: 2rem;
 }
 
+.opencode-sessions-card-missing {
+  border-style: dashed;
+  opacity: 0.55;
+  cursor: default;
+}
+
+.opencode-sessions-card-missing:hover {
+  background: var(--background-primary);
+}
+
+.oc-id-input {
+  width: 100%;
+  margin-bottom: 0.6rem;
+  font-family: var(--font-monospace);
+}
+
 /* New-session directory picker */
 .opencode-new-session-view {
   padding: 1rem;

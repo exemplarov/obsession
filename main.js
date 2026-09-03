@@ -1,4 +1,4 @@
-const { Plugin, ItemView, MarkdownRenderChild, MarkdownRenderer, Notice, PluginSettingTab, Setting, setIcon } = require("obsidian");
+const { Plugin, ItemView, MarkdownRenderChild, MarkdownRenderer, Modal, Notice, PluginSettingTab, Setting, setIcon } = require("obsidian");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -674,6 +674,23 @@ class SessionsDashboard {
     return String(this.options.layout || "cards").toLowerCase() === "table" ? "table" : "cards";
   }
 
+  // Explicit `sessions:` ids listed in the block (deduped, order preserved).
+  pinnedSessionIds() {
+    const raw = this.options.sessions;
+    if (!Array.isArray(raw)) return [];
+    return [...new Set(raw.map((id) => String(id || "").trim()).filter(Boolean))];
+  }
+
+  // Widget mode: only explicit session ids, no dirs — a clean pinned strip
+  // without the toolbar (refresh/search/new).
+  sessionsOnlyMode() {
+    return (
+      this.pinnedSessionIds().length > 0 &&
+      this.options.dirs === undefined &&
+      this.options.directories === undefined
+    );
+  }
+
   async mount() {
     const { container } = this;
     container.addClass("opencode-sessions-dashboard");
@@ -682,27 +699,29 @@ class SessionsDashboard {
       container.createEl("h2", { text: String(this.options.title) });
     }
 
-    const toolbar = container.createDiv({ cls: "opencode-sessions-cards-toolbar" });
-    this.statusEl = toolbar.createSpan({ cls: "opencode-sessions-cards-count", text: "Loading…" });
-    this.filterInput = toolbar.createEl("input", {
-      type: "search",
-      cls: "opencode-sessions-cards-filter",
-      placeholder: "Filter title, state, model, agent, or session ID…",
-    });
-    this.filterInput.addEventListener("input", () => {
-      this.filterNeedle = this.filterInput.value.trim().toLowerCase();
-      this.visible = this.basePageSize();
-      this.render();
-    });
-    const refreshButton = toolbar.createEl("button", { text: "Refresh" });
-    refreshButton.addEventListener("click", () => this.load());
-    const newButton = toolbar.createEl("button", { text: "New session" });
-    newButton.addEventListener("click", () =>
-      this.plugin.newSession({ dirs: this.options.dirs, basedir: this.options.basedir }),
-    );
-    if (this.options.showSettings) {
-      const settingsButton = toolbar.createEl("button", { text: "Settings" });
-      settingsButton.addEventListener("click", () => this.plugin.openSettings());
+    if (!this.sessionsOnlyMode()) {
+      const toolbar = container.createDiv({ cls: "opencode-sessions-cards-toolbar" });
+      this.statusEl = toolbar.createSpan({ cls: "opencode-sessions-cards-count", text: "Loading…" });
+      this.filterInput = toolbar.createEl("input", {
+        type: "search",
+        cls: "opencode-sessions-cards-filter",
+        placeholder: "Filter title, state, model, agent, or session ID…",
+      });
+      this.filterInput.addEventListener("input", () => {
+        this.filterNeedle = this.filterInput.value.trim().toLowerCase();
+        this.visible = this.basePageSize();
+        this.render();
+      });
+      const refreshButton = toolbar.createEl("button", { text: "Refresh" });
+      refreshButton.addEventListener("click", () => this.load());
+      const newButton = toolbar.createEl("button", { text: "New session" });
+      newButton.addEventListener("click", () =>
+        this.plugin.newSession({ dirs: this.options.dirs, basedir: this.options.basedir }),
+      );
+      if (this.options.showSettings) {
+        const settingsButton = toolbar.createEl("button", { text: "Settings" });
+        settingsButton.addEventListener("click", () => this.plugin.openSettings());
+      }
     }
 
     this.errorEl = container.createDiv({ cls: "opencode-sessions-status" });
@@ -730,17 +749,32 @@ class SessionsDashboard {
 
   async load() {
     if (this.disposed) return;
+    const pinnedIds = this.pinnedSessionIds();
+    let pinnedRows = [];
+    let missingRows = [];
+    if (pinnedIds.length) {
+      const { rows, missing } = await this.plugin.loadSessionRowsByIds(pinnedIds);
+      pinnedRows = rows;
+      missingRows = missing.map((id) => this.plugin.missingSessionRow(id));
+    }
     try {
-      const rows = await this.plugin.loadSessions({
-        dirs: this.options.dirs,
-        basedir: this.options.basedir,
-      });
-      if (this.disposed) return;
-      this.sessions = rows;
+      if (this.sessionsOnlyMode()) {
+        this.sessions = [...pinnedRows, ...missingRows];
+      } else {
+        const rows = await this.plugin.loadSessions({
+          dirs: this.options.dirs,
+          basedir: this.options.basedir,
+        });
+        // Pinned sessions lead; exclude them from the directory-driven list
+        // so nothing shows up twice.
+        const pinnedSet = new Set(pinnedIds);
+        this.sessions = [...pinnedRows, ...rows.filter((row) => !pinnedSet.has(row.id)), ...missingRows];
+      }
       this.errorEl.setText("");
     } catch (error) {
       if (this.disposed) return;
       this.errorEl.setText(`OpenCode sessions unavailable: ${error.message}`);
+      this.sessions = [...pinnedRows, ...missingRows];
     }
     this.render();
   }
@@ -759,18 +793,25 @@ class SessionsDashboard {
   render() {
     if (this.disposed || !this.listEl) return;
     const filtered = this.filteredSessions();
-    const shown = filtered.slice(0, this.visible);
-    const live = this.plugin.serverEvents?.connected ? " · live" : " · offline (db)";
-    this.statusEl.setText(
-      `${filtered.length} of ${this.sessions.length} session${filtered.length === 1 ? "" : "s"}${live}`,
-    );
+    const sessionsOnly = this.sessionsOnlyMode();
+    // Widget mode shows everything listed; paginated mode never truncates
+    // the pinned rows off the first page.
+    const shown = sessionsOnly
+      ? filtered
+      : filtered.slice(0, Math.max(this.visible, this.pinnedSessionIds().length));
+    if (this.statusEl) {
+      const live = this.plugin.serverEvents?.connected ? " · live" : " · offline (db)";
+      this.statusEl.setText(
+        `${filtered.length} of ${this.sessions.length} session${filtered.length === 1 ? "" : "s"}${live}`,
+      );
+    }
     this.listEl.empty();
     if (this.layout() === "table") {
       this.renderTable(shown);
     } else {
       this.renderCards(shown);
     }
-    const remaining = filtered.length - shown.length;
+    const remaining = sessionsOnly ? 0 : filtered.length - shown.length;
     this.moreButton.setText(remaining > 0 ? `Show more (${remaining} remaining)` : "");
     this.moreButton.style.display = remaining > 0 ? "" : "none";
   }
@@ -785,13 +826,13 @@ class SessionsDashboard {
   renderCards(sessions) {
     for (const session of sessions) {
       const card = this.listEl.createDiv({
-        cls: `opencode-sessions-card opencode-sessions-card-${session.state || "none"}`,
+        cls: `opencode-sessions-card opencode-sessions-card-${session.state || "none"}${session.missing ? " opencode-sessions-card-missing" : ""}`,
       });
       card.addEventListener("click", () => this.plugin.openSession(session.id));
       const head = card.createDiv({ cls: "opencode-sessions-card-head" });
       const title = head.createSpan({
         cls: "opencode-sessions-card-title",
-        text: session.titleLabel,
+        text: session.missing ? `${session.titleLabel} (not found)` : session.titleLabel,
       });
       title.title = "Open session";
       head.createSpan({
@@ -2431,6 +2472,18 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       name: "New OpenCode session",
       callback: () => this.newSession(),
     });
+    this.addCommand({
+      id: "open-session-by-id",
+      name: "Open session by ID",
+      callback: () => this.promptForSessionId(),
+    });
+    // Links from notes: [label](opencode-session://open?sessionId=ses_…)
+    this.registerObsidianProtocolHandler("opencode-session", (params) => {
+      const id = [params.sessionId, params.session, params.id].find(
+        (value) => typeof value === "string" && value.startsWith("ses_"),
+      );
+      if (id) this.openSession(id);
+    });
     this.addRibbonIcon("messages-square", "Open OpenCode sessions", () => this.activateView());
     this.addSettingTab(new OpenCodeSessionsSettingTab(this.app, this));
     this.configureRefreshTimer();
@@ -2762,6 +2815,34 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.app.setting.openTabById(this.manifest.id);
   }
 
+  promptForSessionId() {
+    const modal = new Modal(this.app);
+    modal.titleEl.setText("Open OpenCode session");
+    const input = modal.contentEl.createEl("input", {
+      type: "text",
+      cls: "oc-id-input",
+      attr: { placeholder: "ses_…", spellcheck: "false" },
+    });
+    const submit = async () => {
+      const id = input.value.trim();
+      modal.close();
+      if (id.startsWith("ses_")) {
+        await this.openSession(id);
+      } else {
+        new Notice("OpenCode session IDs start with ses_");
+      }
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        submit();
+      }
+    });
+    modal.contentEl.createEl("button", { cls: "mod-cta", text: "Open" }).addEventListener("click", submit);
+    modal.onOpen = () => input.focus();
+    modal.open();
+  }
+
   // ----- SQLite listing (works without the server) ---------------------------
 
   // Normalizes directory options shared by listing and new-session picking.
@@ -2857,6 +2938,45 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       `SELECT * FROM session_v2 WHERE id = ${quoteSql(sessionId)} LIMIT 1`,
     );
     return rows[0] || null;
+  }
+
+  // Rows for explicitly pinned session ids (widget mode); preserves the
+  // given order and reports ids that no longer exist.
+  async loadSessionRowsByIds(ids) {
+    const rows = [];
+    const missing = [];
+    for (const id of ids) {
+      try {
+        const row = await this.loadSessionFromDb(id);
+        if (row) {
+          rows.push(this.decorateRow({ ...row, source: "opencode2" }, ""));
+        } else {
+          missing.push(id);
+        }
+      } catch {
+        missing.push(id);
+      }
+    }
+    return { rows, missing };
+  }
+
+  // Placeholder row for a pinned id that is not in the database (deleted or
+  // wrong id) — rendered as a dashed, muted card so typos are visible.
+  missingSessionRow(id) {
+    return {
+      id,
+      title: null,
+      titleLabel: id,
+      state: "none",
+      stateLabel: "",
+      modelLabel: "",
+      updatedLabel: "",
+      directoryLabel: "",
+      tokensLabel: "",
+      agent: "",
+      source: "opencode2",
+      missing: true,
+    };
   }
 
   async loadMessagesFromDb(sessionId) {

@@ -66,12 +66,23 @@ Options (simple `key: value` lines or a JSON object):
 | Option | Default | Description |
 | --- | --- | --- |
 | `dirs` | plugin setting | Directories to list sessions for. Relative entries resolve against `basedir`. |
+| `sessions` | – | Explicit session ids (list). With **only** `sessions` the block renders a clean widget: just the cards, no toolbar. With `sessions` **and** `dirs`, the listed sessions render first (pinned) and are excluded from the directory list to avoid doubling. Missing ids render as dashed "(not found)" cards. |
 | `basedir` | – | Prefix for relative `dirs`; cards/tables show directories relative to it. |
 | `layout` | `cards` | `cards` (single-column multi-line cards) or `table`. |
 | `pageSize` | plugin setting | Sessions per page (the **Items per page** setting, 10 by default). |
 | `title` | – | Optional heading above the dashboard. |
 
 Click a card (or table row) to open the live chat view; click a session ID to copy it.
+
+## Linking to sessions
+
+Markdown links open the chat tab for a session:
+
+```markdown
+[Yesterday's refactor](opencode-session://open?sessionId=ses_abc123)
+```
+
+There's also *Open session by ID* in the command palette (paste a `ses_…` id).
 
 ## Settings
 
