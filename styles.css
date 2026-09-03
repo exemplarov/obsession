@@ -538,6 +538,74 @@
   text-transform: capitalize;
 }
 
+/* Permission approval banner */
+.oc-permission {
+  flex: 0 0 auto;
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--color-orange) 45%, var(--background-modifier-border));
+  border-left: 3px solid var(--color-orange);
+  border-radius: var(--radius-m);
+  background: color-mix(in srgb, var(--color-orange) 7%, var(--background-primary));
+}
+
+.oc-permission-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-weight: var(--font-bold);
+  color: var(--color-orange);
+}
+
+.oc-permission-icon {
+  display: inline-flex;
+  color: var(--color-orange);
+}
+
+.oc-permission-resources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0.4rem 0 0.1rem;
+}
+
+.oc-permission-resource {
+  font-family: var(--font-monospace);
+  font-size: var(--font-smallest);
+  padding: 0.05rem 0.4rem;
+  border-radius: var(--radius-s);
+  background: var(--background-modifier-hover);
+  overflow-wrap: anywhere;
+}
+
+.oc-permission-save {
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+  margin: 0.25rem 0 0;
+}
+
+.oc-permission-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.oc-permission-actions button {
+  font-size: var(--font-smaller);
+}
+
+.oc-permission-allow {
+  color: var(--color-green) !important;
+}
+
+.oc-permission-always {
+  color: var(--text-muted) !important;
+}
+
+.oc-permission-reject {
+  color: var(--color-red) !important;
+}
+
 .oc-composer {
   flex: 0 0 auto;
   display: flex;

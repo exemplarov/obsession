@@ -470,6 +470,17 @@ class OpenCodeClient {
     });
   }
 
+  sessionPermissions(sessionId) {
+    return this.request(`/api/session/${encodeURIComponent(sessionId)}/permission`);
+  }
+
+  replyPermission(sessionId, requestId, reply) {
+    return this.request(
+      `/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(requestId)}/reply`,
+      { method: "POST", body: { reply } },
+    );
+  }
+
   prompt(sessionId, text) {
     return this.request(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
       method: "POST",
@@ -914,6 +925,8 @@ class SessionChatView extends ItemView {
     this.unsubscribed = false;
     this.reconcileTimer = null;
     this.loadSeq = 0;
+    this.pendingPermission = null;
+    this.replyingPermission = false;
     this.lastLoadedAt = 0;
     this.refreshing = false;
   }
@@ -1043,6 +1056,12 @@ class SessionChatView extends ItemView {
       if (el.scrollTop <= visualTop + 140) this.loadOlder();
     });
 
+    // Permission approval banner: sits between the transcript and the
+    // composer so a pending approval is always visible (the chat is
+    // bottom-anchored, a banner inside the stream could scroll away).
+    this.permissionEl = contentEl.createDiv({ cls: "oc-permission" });
+    this.permissionEl.style.display = "none";
+
     const composer = contentEl.createDiv({ cls: "oc-composer" });
     this.inputEl = composer.createEl("textarea", {
       cls: "oc-input",
@@ -1087,6 +1106,8 @@ class SessionChatView extends ItemView {
     this.stopButton.style.display = "";
     if (this.offline) {
       this.hintEl.setText("Offline — input disabled");
+    } else if (this.pendingPermission) {
+      this.hintEl.setText("Waiting for your approval — the session is paused");
     } else if (this.isDraft()) {
       this.hintEl.setText("Draft — your first message will create the session");
     } else if (this.busy) {
@@ -1116,7 +1137,13 @@ class SessionChatView extends ItemView {
       return;
     }
     const live = this.plugin.getLiveState(this.sessionId);
-    const state = this.busy ? "running" : live && live.status !== "running" ? live.status : "idle";
+    const state = this.pendingPermission
+      ? "waiting"
+      : this.busy
+        ? "running"
+        : live && live.status !== "running"
+          ? live.status
+          : "idle";
     this.badgeEl.className = `opencode-sessions-badge opencode-sessions-badge-${state}`;
     this.badgeEl.setText(STATE_LABELS[state] || "");
   }
@@ -1180,6 +1207,7 @@ class SessionChatView extends ItemView {
       this.renderBadge();
       this.lastLoadedAt = Date.now();
       this.loadModels().catch(() => {});
+      this.refreshPendingPermission().catch(() => {});
     } catch (error) {
       if (this.unsubscribed || seq !== this.loadSeq) return;
       this.setOffline(true, error.message);
@@ -1679,12 +1707,116 @@ class SessionChatView extends ItemView {
         this.finalizeStep(data);
         break;
       case "permission.asked":
-        // The session pauses until the permission is answered elsewhere.
-        this.renderBadge();
-        this.hintEl.setText("Waiting for permission approval…");
+        this.setPendingPermission(data);
+        break;
+      case "permission.replied":
+        // Covers replies made anywhere (this banner, the TUI, elsewhere).
+        this.clearPendingPermission(data?.requestID);
         break;
       default:
         break;
+    }
+  }
+
+  // ----- permission handling --------------------------------------------------
+
+  setPendingPermission(request) {
+    if (!request?.id || !this.sessionId) return;
+    this.pendingPermission = {
+      id: request.id,
+      action: request.action || "permission",
+      resources: Array.isArray(request.resources) ? request.resources : [],
+      save: Array.isArray(request.save) ? request.save : [],
+      message: request.message || "",
+    };
+    this.renderPermissionBanner();
+    this.renderBadge();
+    this.updateComposer();
+  }
+
+  clearPendingPermission(requestId) {
+    if (!this.pendingPermission) return;
+    if (requestId && this.pendingPermission.id !== requestId) return;
+    this.pendingPermission = null;
+    this.renderPermissionBanner();
+    this.renderBadge();
+    this.updateComposer();
+  }
+
+  // Recovers a pending approval on view open / refresh (e.g. a session that
+  // was already waiting, or a reply made while this tab was reconnecting).
+  async refreshPendingPermission() {
+    if (!this.sessionId || this.offline) return;
+    try {
+      const response = await this.plugin.client.sessionPermissions(this.sessionId);
+      if (this.unsubscribed) return;
+      const pending = (response?.data || [])[0] || null;
+      if (pending) {
+        this.setPendingPermission(pending);
+      } else if (this.pendingPermission) {
+        this.clearPendingPermission();
+      }
+    } catch {
+      // server hiccup — the event stream keeps us informed anyway
+    }
+  }
+
+  renderPermissionBanner() {
+    const banner = this.permissionEl;
+    if (!banner) return;
+    banner.empty();
+    if (!this.pendingPermission) {
+      banner.style.display = "none";
+      return;
+    }
+    const { action, resources, save } = this.pendingPermission;
+    banner.style.display = "";
+    const head = banner.createDiv({ cls: "oc-permission-head" });
+    setIcon(head.createSpan({ cls: "oc-permission-icon" }), "shield-alert");
+    head.createSpan({
+      cls: "oc-permission-title",
+      text: `Needs approval — ${String(action).replaceAll("_", " ")}`,
+    });
+    if (resources.length) {
+      const list = banner.createDiv({ cls: "oc-permission-resources" });
+      for (const resource of resources) {
+        list.createEl("span", { cls: "oc-permission-resource", text: resource });
+      }
+    }
+    if (save.length) {
+      banner.createDiv({
+        cls: "oc-permission-save",
+        text: `"Always" saves a rule for ${save.join(", ")}`,
+      });
+    }
+    const actions = banner.createDiv({ cls: "oc-permission-actions" });
+    const reject = actions.createEl("button", { cls: "oc-permission-reject", text: "Reject" });
+    reject.addEventListener("click", () => this.replyToPermission("reject"));
+    if (save.length) {
+      const always = actions.createEl("button", { cls: "oc-permission-always", text: "Always allow" });
+      always.addEventListener("click", () => this.replyToPermission("always"));
+    }
+    const allow = actions.createEl("button", { cls: "oc-permission-allow", text: "Allow" });
+    allow.addEventListener("click", () => this.replyToPermission("once"));
+  }
+
+  async replyToPermission(reply) {
+    const pending = this.pendingPermission;
+    if (!pending || this.replyingPermission) return;
+    this.replyingPermission = true;
+    try {
+      await this.plugin.client.replyPermission(this.sessionId, pending.id, reply);
+      this.clearPendingPermission(pending.id);
+      new Notice(`Permission ${reply === "reject" ? "rejected" : reply === "always" ? "saved as always-allow" : "approved"}`);
+    } catch (error) {
+      // Already answered elsewhere (TUI, another tab): 404 — just clear it.
+      if (String(error.message).startsWith("404")) {
+        this.clearPendingPermission(pending.id);
+      } else {
+        new Notice(`Permission reply failed: ${error.message}`);
+      }
+    } finally {
+      this.replyingPermission = false;
     }
   }
 
@@ -1843,6 +1975,7 @@ class SessionChatView extends ItemView {
       }
       this.lastLoadedAt = Date.now();
       if (this.offline) this.setOffline(false);
+      this.refreshPendingPermission().catch(() => {});
     } catch {
       // ignore — the next event or manual refresh will retry
     }
@@ -2394,6 +2527,11 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       case "permission.asked":
         if (sessionId) this.setLiveState(sessionId, "waiting");
         break;
+      case "permission.replied":
+        // The agent loop resumes after a reply (approve continues the tool,
+        // reject fails it) — running until the execution result lands.
+        if (sessionId) this.setLiveState(sessionId, "running");
+        break;
       default:
         break;
     }
@@ -2803,6 +2941,7 @@ const LIST_REFRESH_EVENTS = new Set([
   "session.inbox.enqueued",
   "session.inbox.delivered",
   "permission.asked",
+  "permission.replied",
   "session.step.started",
   "session.step.ended",
   "session.deleted",

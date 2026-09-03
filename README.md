@@ -36,6 +36,13 @@ from `~/.local/state/opencode/service.json`, and reads the v2 SQLite database
   (`~/.local/state/opencode/model.json`), falling back to the server's
   location-aware default. Drafts pass it at creation; existing sessions
   switch live via `POST /api/session/{id}/model`.
+- **Approvals**: when a session needs a permission (e.g. writing outside its
+  directory), an approval banner appears above the composer with the action
+  and affected resources — **Allow** (once), **Always allow** (saves a rule),
+  or **Reject** — via `POST /api/session/{id}/permission/{requestID}/reply`.
+  Replies made anywhere (TUI, another tab) clear the banner via
+  `permission.replied` events; pending approvals are recovered on view open
+  and reconnect.
 - **Stale-tab refresh**: chat tabs refresh on focus/reconnect/layout (thanks
   to lifecycle watching), with a manual header Refresh button.
 - Offline fallback: when the server is down, the chat shows the conversation
