@@ -909,7 +909,7 @@ class SessionChatView extends ItemView {
     // messageID -> { el, msg, json, parts: Map(key -> {el, kind, text, ...}) }
     this.messages = new Map();
     this.order = [];
-    this.cursorPrevious = null;
+    this.cursorOlder = null;
     this.loadingOlder = false;
     this.unsubscribed = false;
     this.reconcileTimer = null;
@@ -1033,6 +1033,15 @@ class SessionChatView extends ItemView {
     });
     this.olderButton.addEventListener("click", () => this.loadOlder());
     this.olderButton.style.display = "none";
+    // Infinite scroll upward: in a column-reverse container scrollTop is 0 at
+    // the bottom and most negative at the visual top, so hitting the top of
+    // the loaded history pages in the previous 100 messages automatically.
+    this.chatEl.addEventListener("scroll", () => {
+      if (this.loadingOlder || !this.cursorOlder || this.offline) return;
+      const el = this.chatEl;
+      const visualTop = -(el.scrollHeight - el.clientHeight);
+      if (el.scrollTop <= visualTop + 140) this.loadOlder();
+    });
 
     const composer = contentEl.createDiv({ cls: "oc-composer" });
     this.inputEl = composer.createEl("textarea", {
@@ -1151,13 +1160,19 @@ class SessionChatView extends ItemView {
     try {
       const [sessionResponse, messagesResponse] = await Promise.all([
         this.plugin.client.session(this.sessionId),
-        this.plugin.client.messages(this.sessionId, { limit: DEFAULT_MESSAGE_PAGE, order: "asc" }),
+        // Newest page first: order=desc guarantees the latest messages are
+        // included even in long sessions (order=asc&limit returns the
+        // OLDEST page — sessions over the limit lose their tail).
+        this.plugin.client.messages(this.sessionId, { limit: DEFAULT_MESSAGE_PAGE, order: "desc" }),
       ]);
       if (this.unsubscribed || seq !== this.loadSeq) return;
       this.setOffline(false);
       this.session = sessionResponse?.data || null;
       this.resetMessages();
-      this.appendMessages(messagesResponse?.data || [], messagesResponse?.cursor?.previous || null);
+      this.appendMessages(
+        [...(messagesResponse?.data || [])].reverse(),
+        messagesResponse?.cursor?.next || null,
+      );
       // If the session is already running (view opened mid-stream), adopt it.
       const live = this.plugin.getLiveState(this.sessionId);
       this.setBusy(live?.status === "running" || live?.status === "waiting");
@@ -1394,17 +1409,20 @@ class SessionChatView extends ItemView {
     this.chatEl.findAll(".oc-msg").forEach((el) => el.remove());
     this.messages.clear();
     this.order = [];
+    this.cursorOlder = null;
     this.olderButton.style.display = "none";
   }
 
-  appendMessages(list, cursorPrevious) {
+  // `cursorOlder` continues pagination toward older messages (cursor-only
+  // requests; with order=desc the "next" cursor pages older).
+  appendMessages(list, cursorOlder) {
     for (const message of list || []) {
       this.upsertMessage(message);
     }
-    if (cursorPrevious !== null && cursorPrevious !== undefined) {
-      this.cursorPrevious = cursorPrevious;
+    if (cursorOlder !== null && cursorOlder !== undefined) {
+      this.cursorOlder = cursorOlder;
     }
-    this.olderButton.style.display = this.cursorPrevious ? "" : "none";
+    this.olderButton.style.display = this.cursorOlder ? "" : "none";
   }
 
   // Creates or updates a message element. Returns the message record.
@@ -1813,9 +1831,9 @@ class SessionChatView extends ItemView {
     if (this.unsubscribed || this.offline || !this.sessionId || this.isDraft()) return;
     try {
       const limit = Math.max(DEFAULT_MESSAGE_PAGE, this.messages.size);
-      const response = await this.plugin.client.messages(this.sessionId, { limit, order: "asc" });
+      const response = await this.plugin.client.messages(this.sessionId, { limit, order: "desc" });
       if (this.unsubscribed) return;
-      for (const message of response?.data || []) {
+      for (const message of [...(response?.data || [])].reverse()) {
         this.upsertMessage(message);
       }
       const sessionResponse = await this.plugin.client.session(this.sessionId).catch(() => null);
@@ -1831,35 +1849,39 @@ class SessionChatView extends ItemView {
   }
 
   async loadOlder() {
-    if (this.loadingOlder || !this.cursorPrevious || this.offline) return;
+    if (this.loadingOlder || !this.cursorOlder || this.offline) return;
     this.loadingOlder = true;
     this.olderButton.setText("Loading…");
     const chat = this.chatEl;
     const beforeHeight = chat.scrollHeight;
     const beforeTop = chat.scrollTop;
     try {
+      // Cursor-only request (cursors must not combine with order); pages
+      // continue toward older messages in newest→oldest order.
       const response = await this.plugin.client.messages(this.sessionId, {
-        order: "asc",
-        cursor: this.cursorPrevious,
+        limit: DEFAULT_MESSAGE_PAGE,
+        cursor: this.cursorOlder,
       });
       const list = response?.data || [];
-      this.cursorPrevious = response?.cursor?.previous || null;
+      this.cursorOlder = response?.cursor?.next || null;
       // Older messages belong at the visual top = END of the DOM (the chat
-      // is column-reverse), inserted newest-of-batch first so the final DOM
-      // order stays chronological.
-      for (const message of [...list].reverse()) {
+      // is column-reverse). Batches arrive newest→oldest, so inserting each
+      // before the "Load older" button keeps the DOM chronologically
+      // newest-first.
+      for (const message of list) {
         if (this.messages.has(message.id)) continue;
         const el = this.renderOlderMessageEl(message);
         chat.insertBefore(el, this.olderButton);
       }
-      // Keep the viewport on the same content: content was added above.
+      // Keep the viewport on the same content: content was added above
+      // (column-reverse scrollTop is 0 at the bottom, negative upward).
       chat.scrollTop = beforeTop - (chat.scrollHeight - beforeHeight);
     } catch (error) {
       new Notice(`Could not load older messages: ${error.message}`);
     } finally {
       this.loadingOlder = false;
       this.olderButton.setText("Load older messages");
-      this.olderButton.style.display = this.cursorPrevious ? "" : "none";
+      this.olderButton.style.display = this.cursorOlder ? "" : "none";
     }
   }
 

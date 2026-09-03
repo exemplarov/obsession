@@ -20,9 +20,9 @@ from `~/.local/state/opencode/service.json`, and reads the v2 SQLite database
   Running…, Idle, Needs approval, Interrupted, Error — updated the instant they
   change. Falls back to SQLite heuristics when the server is unreachable.
 - **Session chat view**: click any session to open it. Messages stream in live
-  (text + reasoning + tool calls with input/output), history loads from the API
-  with *Load older*, and — via a `flex-direction: column-reverse` trick — new
-  content always attaches to the **bottom** of the chat and stays in view.
+  (text + reasoning + tool calls with input/output); history loads the newest
+  page first and pages in older messages as you scroll to the top (or via the
+  *Load older* button) — long sessions no longer lose their tail.
 - **Prompt & stop**: send messages to a session (`POST /api/session/{id}/prompt`)
   and interrupt a running one (`POST /api/session/{id}/interrupt`) right from
   the composer.
