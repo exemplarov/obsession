@@ -1,7 +1,7 @@
 {
   "id": "opencode-sessions",
   "name": "OpenCode Sessions",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "minAppVersion": "1.4.0",
   "description": "Browse OpenCode v2 sessions, watch them stream live, and chat with them from Obsidian.",
   "author": "Roman",

@@ -225,6 +225,20 @@
   flex-direction: column;
   height: 100%;
   padding: 0.75rem 1rem 0.5rem;
+  /* Obsidian's app shell disables selection (note views re-enable it);
+     custom views must opt back in so chat output can be copied. */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Keep interactive chrome non-selectable. */
+.opencode-session-view button,
+.opencode-session-view select,
+.opencode-session-view summary,
+.opencode-session-view .opencode-sessions-badge,
+.opencode-session-view .oc-hint {
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .opencode-session-empty {
