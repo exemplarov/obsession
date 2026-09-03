@@ -448,6 +448,28 @@ class OpenCodeClient {
     return this.request("/api/session/active");
   }
 
+  // Object-typed query params use bracket encoding: location[directory]=…
+  locationQuery(directory) {
+    return directory
+      ? `?${encodeURIComponent("location[directory]")}=${encodeURIComponent(directory)}`
+      : "";
+  }
+
+  models(directory) {
+    return this.request(`/api/model${this.locationQuery(directory)}`);
+  }
+
+  defaultModel(directory) {
+    return this.request(`/api/model/default${this.locationQuery(directory)}`);
+  }
+
+  setSessionModel(sessionId, model) {
+    return this.request(`/api/session/${encodeURIComponent(sessionId)}/model`, {
+      method: "POST",
+      body: { model },
+    });
+  }
+
   prompt(sessionId, text) {
     return this.request(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
       method: "POST",
@@ -949,6 +971,7 @@ class SessionChatView extends ItemView {
       this.renderHeader();
       this.renderBadge();
       this.updateComposer();
+      this.loadModels().catch(() => {});
       return;
     }
     this.contentEl.createDiv({ cls: "opencode-session-empty", text: "No session selected." });
@@ -1024,6 +1047,9 @@ class SessionChatView extends ItemView {
     });
     this.inputEl.addEventListener("input", () => this.autoGrow());
     const actions = composer.createDiv({ cls: "oc-composer-actions" });
+    this.modelSelect = actions.createEl("select", { cls: "oc-model-select" });
+    this.modelSelect.title = "Model";
+    this.modelSelect.addEventListener("change", () => this.onModelChange());
     this.hintEl = actions.createSpan({ cls: "oc-hint", text: "" });
     this.stopButton = actions.createEl("button", { cls: "oc-stop", text: "Stop" });
     this.stopButton.addEventListener("click", () => this.stop());
@@ -1138,10 +1164,149 @@ class SessionChatView extends ItemView {
       this.renderHeader();
       this.renderBadge();
       this.lastLoadedAt = Date.now();
+      this.loadModels().catch(() => {});
     } catch (error) {
       if (this.unsubscribed || seq !== this.loadSeq) return;
       this.setOffline(true, error.message);
       await this.loadFromDb();
+    }
+  }
+
+  // ----- model selector ------------------------------------------------------
+
+  modelRefKey(ref) {
+    return ref ? `${ref.providerID}/${ref.id}${ref.variant ? `·${ref.variant}` : ""}` : "";
+  }
+
+  selectedModelRef() {
+    if (!this.modelSelect?.value) return null;
+    try {
+      const ref = JSON.parse(this.modelSelect.value);
+      return ref?.id && ref?.providerID ? ref : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Populates the model dropdown: a Default entry resolved exactly like the
+  // OpenCode TUI (last-used model + persisted variant from its state file,
+  // falling back to the server's location-aware default), then every
+  // available model grouped by provider, variants expanded inline.
+  async loadModels() {
+    if (!this.modelSelect) return;
+    const directory = this.session?.location?.directory || this.draftDirectory;
+    let models = [];
+    let defaultRef = null;
+    try {
+      const [listResponse, resolvedDefault] = await Promise.all([
+        this.plugin.client.models(directory),
+        this.plugin.resolveDefaultModel(directory),
+      ]);
+      models = Array.isArray(listResponse?.data) ? listResponse.data : [];
+      defaultRef = resolvedDefault;
+    } catch {
+      this.modelSelect.style.display = "none";
+      return;
+    }
+    if (this.unsubscribed) return;
+    const select = this.modelSelect;
+    select.empty();
+
+    const defaultOption = select.createEl("option", {
+      value: defaultRef ? JSON.stringify(defaultRef) : "",
+      text: defaultRef
+        ? `Default — ${defaultRef.id}${defaultRef.variant ? ` (${defaultRef.variant})` : ""}`
+        : "Default",
+    });
+    defaultOption.dataset.isDefault = "1";
+
+    const byProvider = new Map();
+    for (const model of models) {
+      if (!model?.id || !model?.providerID) continue;
+      if (!byProvider.has(model.providerID)) byProvider.set(model.providerID, []);
+      byProvider.get(model.providerID).push(model);
+    }
+    for (const [providerID, providerModels] of [...byProvider.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      const group = select.createEl("optgroup", { attr: { label: providerID } });
+      for (const model of providerModels) {
+        const base = { id: model.id, providerID };
+        group.createEl("option", {
+          value: JSON.stringify(base),
+          text: model.name || model.id,
+        });
+        for (const variant of model.variants || []) {
+          if (!variant?.id) continue;
+          group.createEl("option", {
+            value: JSON.stringify({ ...base, variant: variant.id }),
+            text: `${model.name || model.id} · ${variant.id}`,
+          });
+        }
+      }
+    }
+
+    // Reflect the session's current model (existing sessions), else keep the
+    // Default entry selected so drafts visibly match OpenCode's default.
+    const current = this.session?.model
+      ? { id: this.session.model.id, providerID: this.session.model.providerID, ...(this.session.model.variant ? { variant: this.session.model.variant } : {}) }
+      : null;
+    if (current) this.selectModelRef(current, null);
+    else select.value = defaultOption.value;
+    select.style.display = "";
+  }
+
+  selectModelRef(ref, fallbackValue) {
+    const select = this.modelSelect;
+    if (!select || !ref) {
+      if (select && fallbackValue !== null) select.value = fallbackValue;
+      return;
+    }
+    const exact = this.modelRefKey(ref);
+    const base = `${ref.providerID}/${ref.id}`;
+    let match = null;
+    let baseMatch = null;
+    for (const option of select.options) {
+      if (!option.value) continue;
+      try {
+        const parsed = JSON.parse(option.value);
+        const key = this.modelRefKey(parsed);
+        if (key === exact) match = option;
+        if (key === base) baseMatch = baseMatch || option;
+      } catch {
+        // skip
+      }
+    }
+    if (match) select.value = match.value;
+    else if (baseMatch) select.value = baseMatch.value;
+    else {
+      const injected = select.createEl("option", {
+        value: JSON.stringify(ref),
+        text: `${ref.id}${ref.variant ? ` (${ref.variant})` : ""}`,
+      });
+      select.value = injected.value;
+    }
+  }
+
+  async onModelChange() {
+    if (this.isDraft()) return; // stored in the select; applied at creation
+    const ref = this.selectedModelRef();
+    if (!ref || !this.sessionId) return;
+    const current = this.session?.model;
+    if (
+      current &&
+      current.id === ref.id &&
+      current.providerID === ref.providerID &&
+      (current.variant || null) === (ref.variant || null)
+    ) {
+      return;
+    }
+    try {
+      await this.plugin.client.setSessionModel(this.sessionId, ref);
+      this.session = { ...this.session, model: ref };
+      this.renderHeader();
+      new Notice(`Model switched to ${ref.id}${ref.variant ? ` (${ref.variant})` : ""}`);
+    } catch (error) {
+      new Notice(`Could not switch model: ${error.message}`);
+      this.selectModelRef(current || null, null);
     }
   }
 
@@ -1743,7 +1908,10 @@ class SessionChatView extends ItemView {
     try {
       const created = await this.plugin.client.request("/api/session", {
         method: "POST",
-        body: { location: { directory: this.draftDirectory } },
+        body: {
+          location: { directory: this.draftDirectory },
+          model: this.selectedModelRef() || undefined,
+        },
       });
       const session = created?.data;
       if (!session?.id) throw new Error("server returned no session id");
@@ -2297,6 +2465,39 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       this.listRefreshTimer = null;
       this.emitChange();
     }, 400);
+  }
+
+  // The OpenCode TUI keeps its default model client-side: the most recently
+  // used model (plus its persisted variant) from ~/.local/state/opencode/
+  // model.json. The server's /api/model/default only knows the config
+  // default, so replicate the TUI resolution order for parity.
+  readModelSelectionState() {
+    const parsed = readJsonFile(path.join(xdgPath("XDG_STATE_HOME", ".local/state"), "model.json"));
+    if (!parsed || !Array.isArray(parsed.recent) || !parsed.recent.length) return null;
+    const recent = parsed.recent[0];
+    if (!recent || !recent.providerID || !recent.modelID) return null;
+    const variants = parsed.variant && typeof parsed.variant === "object" ? parsed.variant : {};
+    const variant = variants[`${recent.providerID}/${recent.modelID}`];
+    const ref = { id: recent.modelID, providerID: recent.providerID };
+    if (variant) ref.variant = String(variant);
+    return ref;
+  }
+
+  // Default model for a directory, matching OpenCode's own resolution:
+  // last-used model (TUI state) → server default for that location.
+  async resolveDefaultModel(directory) {
+    const fromState = this.readModelSelectionState();
+    if (fromState) return fromState;
+    try {
+      const response = await this.client.defaultModel(directory);
+      const model = response?.data;
+      if (model?.id && model?.providerID) {
+        return { id: model.id, providerID: model.providerID, ...(model.variant ? { variant: model.variant } : {}) };
+      }
+    } catch {
+      // fall through
+    }
+    return null;
   }
 
   restartServerConnection() {

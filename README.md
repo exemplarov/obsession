@@ -30,6 +30,14 @@ from `~/.local/state/opencode/service.json`, and reads the v2 SQLite database
   *New session* button) picks one of your configured directories — a single
   directory is used automatically, several open a card picker — and starts a
   draft chat; the server session is created with your first message.
+- **Model selector**: every chat has a model dropdown (grouped by provider,
+  variants inline). Its default matches OpenCode exactly — the last-used
+  model *and* its persisted variant from OpenCode's own state
+  (`~/.local/state/opencode/model.json`), falling back to the server's
+  location-aware default. Drafts pass it at creation; existing sessions
+  switch live via `POST /api/session/{id}/model`.
+- **Stale-tab refresh**: chat tabs refresh on focus/reconnect/layout (thanks
+  to lifecycle watching), with a manual header Refresh button.
 - Offline fallback: when the server is down, the chat shows the conversation
   read-only from `session_message` (input disabled).
 - Also exposes an API (`globalThis.opencodeSessions`) for e.g. Datacore JSX consumers.

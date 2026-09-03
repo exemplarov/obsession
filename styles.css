@@ -559,6 +559,14 @@
   gap: 0.5rem;
 }
 
+.oc-model-select {
+  max-width: 13rem;
+  flex-shrink: 0;
+  font-size: var(--font-smaller);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .oc-hint {
   font-size: var(--font-smallest);
   color: var(--text-faint);
