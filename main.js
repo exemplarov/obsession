@@ -2,6 +2,8 @@ const { Plugin, ItemView, MarkdownRenderChild, MarkdownRenderer, Notice, PluginS
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const http = require("http");
+const https = require("https");
 const { execFile } = require("child_process");
 
 const VIEW_TYPE_SESSIONS = "opencode-sessions-view";
@@ -185,6 +187,154 @@ function parseBlockConfig(source) {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP transport. Node's http/https modules instead of fetch: the v2 server
+// does not send CORS headers, and the Obsidian renderer enforces CORS on
+// fetch/EventSource — so browser-network APIs cannot reach localhost:port.
+// Node sockets bypass CORS entirely (plugin is desktop-only anyway).
+// ---------------------------------------------------------------------------
+
+function nodeRequest(url, options = {}) {
+  const { method = "GET", headers = {}, body, timeoutMs = 15000 } = options;
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const transport = parsed.protocol === "https:" ? https : http;
+    const requestHeaders = { ...headers };
+    if (body !== undefined) requestHeaders["content-length"] = String(Buffer.byteLength(body));
+    const req = transport.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+        path: `${parsed.pathname}${parsed.search}`,
+        method,
+        headers: requestHeaders,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode || 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString("utf8"),
+          }),
+        );
+        res.on("error", reject);
+      },
+    );
+    req.on("error", reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`timeout: ${method} ${url}`)));
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+// Minimal SSE client over a Node socket: parses `data:` frames, ignores
+// comments (the server's `: heartbeat` keepalives), and fails if the stream
+// goes silent past idleTimeoutMs so the caller can reconnect.
+class NodeSSE {
+  constructor(url, options = {}) {
+    const { headers = {}, idleTimeoutMs = 45000 } = options;
+    this.url = url;
+    this.headers = headers;
+    this.idleTimeoutMs = idleTimeoutMs;
+    this.onopen = null;
+    this.onmessage = null;
+    this.onerror = null;
+    this.readyState = 0;
+    this.closed = false;
+    this.req = null;
+    this.idleTimer = null;
+    this.buffer = "";
+    this._start();
+  }
+
+  _start() {
+    let parsed;
+    try {
+      parsed = new URL(this.url);
+    } catch (error) {
+      this._fail(error);
+      return;
+    }
+    const transport = parsed.protocol === "https:" ? https : http;
+    const req = transport.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+        path: `${parsed.pathname}${parsed.search}`,
+        method: "GET",
+        headers: { ...this.headers, accept: "text/event-stream", "cache-control": "no-cache" },
+      },
+      (res) => {
+        if (this.closed) {
+          res.destroy();
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          this._fail(new Error(`SSE ${res.statusCode} for ${this.url}`));
+          return;
+        }
+        this.readyState = 1;
+        this._touchIdle();
+        if (this.onopen) this.onopen({});
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          if (this.closed) return;
+          this._touchIdle();
+          this.buffer += chunk;
+          let index;
+          while ((index = this.buffer.indexOf("\n")) !== -1) {
+            const line = this.buffer.slice(0, index).replace(/\r$/, "");
+            this.buffer = this.buffer.slice(index + 1);
+            if (line.startsWith("data:")) {
+              let payload = line.slice(5);
+              if (payload.startsWith(" ")) payload = payload.slice(1);
+              if (this.onmessage) this.onmessage({ data: payload });
+            }
+          }
+        });
+        res.on("end", () => this._fail(new Error("event stream ended")));
+        res.on("error", (error) => this._fail(error));
+      },
+    );
+    req.on("error", (error) => this._fail(error));
+    this.req = req;
+    req.end();
+  }
+
+  _touchIdle() {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      this._fail(new Error(`no data for ${this.idleTimeoutMs}ms (heartbeat lost)`));
+    }, this.idleTimeoutMs);
+  }
+
+  _fail(error) {
+    if (this.closed) return;
+    this.close();
+    if (this.onerror) this.onerror(error);
+  }
+
+  close() {
+    this.closed = true;
+    this.readyState = 2;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+    if (this.req) {
+      this.req.destroy();
+      this.req = null;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // OpenCode v2 (beta) API client. Discovers the local server from
 // ~/.local/state/opencode/service.json, then talks to /api/* with Basic auth.
 // ---------------------------------------------------------------------------
@@ -203,19 +353,15 @@ class OpenCodeClient {
   }
 
   static async probe(baseUrl, password, timeoutMs = 2500) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const headers = { accept: "application/json" };
       if (password) headers.authorization = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
-      const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/api/health`, { headers, signal: controller.signal });
-      if (!res.ok) return null;
-      const body = await res.json().catch(() => null);
+      const res = await nodeRequest(`${baseUrl.replace(/\/+$/, "")}/api/health`, { headers, timeoutMs });
+      if (res.status !== 200) return null;
+      const body = JSON.parse(res.body || "null");
       return body && body.healthy ? body : null;
     } catch {
       return null;
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -254,42 +400,31 @@ class OpenCodeClient {
   async request(pathname, options = {}) {
     const { method = "GET", body, timeoutMs = 15000 } = options;
     const endpoint = await this.resolve();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const headers = { accept: "application/json" };
+    if (endpoint.password) {
+      headers.authorization = `Basic ${Buffer.from(`opencode:${endpoint.password}`).toString("base64")}`;
+    }
+    if (body !== undefined) headers["content-type"] = "application/json";
+    let res;
     try {
-      const headers = { accept: "application/json" };
-      if (endpoint.password) {
-        headers.authorization = `Basic ${Buffer.from(`opencode:${endpoint.password}`).toString("base64")}`;
-      }
-      if (body !== undefined) headers["content-type"] = "application/json";
-      const res = await fetch(`${endpoint.baseUrl}${pathname}`, {
+      res = await nodeRequest(`${endpoint.baseUrl}${pathname}`, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: controller.signal,
+        timeoutMs,
       });
-      if (!res.ok) {
-        let detail = "";
-        try {
-          detail = (await res.text()).slice(0, 200);
-        } catch {
-          // ignore
-        }
-        if (res.status === 401) this.invalidate();
-        throw new Error(`${res.status} ${res.statusText}${detail ? ` — ${detail}` : ""}`);
-      }
-      if (res.status === 204) return null;
-      const contentType = res.headers.get("content-type") || "";
-      return contentType.includes("json") ? await res.json() : await res.text();
     } catch (error) {
-      if (error.name === "AbortError") {
-        throw new Error(`timeout: ${method} ${pathname}`);
-      }
       this.invalidate();
       throw error;
-    } finally {
-      clearTimeout(timer);
     }
+    if (res.status === 401) this.invalidate();
+    if (res.status < 200 || res.status >= 300) {
+      const detail = res.body ? ` — ${res.body.slice(0, 200)}` : "";
+      throw new Error(`${res.status}${detail}`);
+    }
+    if (res.status === 204) return null;
+    const contentType = String(res.headers["content-type"] || "");
+    return contentType.includes("json") ? JSON.parse(res.body || "null") : res.body;
   }
 
   health() {
@@ -395,8 +530,11 @@ class ServerEventStream {
       return;
     }
     if (!this.started) return;
-    const url = `${endpoint.baseUrl}/api/event${endpoint.password ? `?auth_token=${Buffer.from(`opencode:${endpoint.password}`).toString("base64")}` : ""}`;
-    const source = new EventSource(url);
+    const headers = {};
+    if (endpoint.password) {
+      headers.authorization = `Basic ${Buffer.from(`opencode:${endpoint.password}`).toString("base64")}`;
+    }
+    const source = new NodeSSE(`${endpoint.baseUrl}/api/event`, { headers });
     this.source = source;
     source.onopen = () => {
       this.attempt = 0;
@@ -413,14 +551,13 @@ class ServerEventStream {
       if (event && event.type) this.plugin.handleServerEvent(event);
     };
     source.onerror = () => {
+      // NodeSSE closes itself before reporting; re-discover and retry with
+      // backoff (idle watchdog, stream end, socket error, bad status).
+      if (source !== this.source) return;
+      this.closeSource();
       this.setConnected(false);
-      // CLOSED means the browser gave up (bad URL/auth) — re-discover and
-      // reconnect with backoff. CONNECTING means it retries on its own.
-      if (source === this.source && source.readyState === EventSource.CLOSED) {
-        this.closeSource();
-        this.plugin.client.invalidate();
-        this.reconnectSoon(Math.min(30000, 1000 * 2 ** Math.min(5, ++this.attempt)));
-      }
+      this.plugin.client.invalidate();
+      this.reconnectSoon(Math.min(30000, 1000 * 2 ** Math.min(5, ++this.attempt)));
     };
   }
 
@@ -746,6 +883,12 @@ class SessionChatView extends ItemView {
     const { contentEl } = this;
     const header = contentEl.createDiv({ cls: "oc-header" });
     const titleRow = header.createDiv({ cls: "oc-header-row" });
+    this.backButton = titleRow.createEl("button", {
+      cls: "oc-icon-button oc-back",
+      attr: { "aria-label": "Back to sessions" },
+    });
+    setIcon(this.backButton, "arrow-left");
+    this.backButton.addEventListener("click", () => this.plugin.activateView());
     this.titleEl = titleRow.createEl("span", { cls: "oc-title", text: this.sessionId });
     this.badgeEl = titleRow.createSpan({
       cls: "opencode-sessions-badge opencode-sessions-badge-none",

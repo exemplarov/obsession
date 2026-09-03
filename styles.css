@@ -257,6 +257,21 @@
   flex-shrink: 0;
 }
 
+.oc-back {
+  flex-shrink: 0;
+  padding: 0.15rem 0.35rem;
+  display: inline-flex;
+  align-items: center;
+  box-shadow: none;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+}
+
+.oc-back:hover {
+  color: var(--text-normal);
+}
+
 .oc-icon-button {
   flex-shrink: 0;
   margin-left: auto;
