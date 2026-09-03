@@ -1,4 +1,4 @@
-const { Plugin, ItemView, MarkdownRenderChild, MarkdownRenderer, Notice, PluginSettingTab, Setting } = require("obsidian");
+const { Plugin, ItemView, MarkdownRenderChild, MarkdownRenderer, Notice, PluginSettingTab, Setting, setIcon } = require("obsidian");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
