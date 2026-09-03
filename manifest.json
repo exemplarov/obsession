@@ -1,9 +1,9 @@
 {
   "id": "opencode-sessions",
   "name": "OpenCode Sessions",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "minAppVersion": "1.4.0",
-  "description": "Shows local OpenCode sessions for configured directories.",
+  "description": "Browse OpenCode v2 sessions, watch them stream live, and chat with them from Obsidian.",
   "author": "Roman",
   "isDesktopOnly": true
 }

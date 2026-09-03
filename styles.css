@@ -55,9 +55,12 @@
   white-space: nowrap;
 }
 
+.opencode-sessions-table tbody tr {
+  cursor: pointer;
+}
+
 .opencode-sessions-title {
   color: var(--text-accent);
-  cursor: pointer;
   min-width: 14rem;
 }
 
@@ -70,7 +73,16 @@
   font-weight: var(--font-bold);
 }
 
-.opencode-sessions-state-suspended {
+.opencode-sessions-state-suspended,
+.opencode-sessions-state-waiting {
+  color: var(--color-orange);
+}
+
+.opencode-sessions-state-error {
+  color: var(--color-red);
+}
+
+.opencode-sessions-state-interrupted {
   color: var(--color-orange);
 }
 
@@ -117,6 +129,12 @@
   border-radius: var(--radius-m);
   background: var(--background-primary);
   overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.opencode-sessions-card:hover {
+  border-color: var(--background-modifier-border-hover);
+  background: var(--background-secondary);
 }
 
 .opencode-sessions-card-running {
@@ -132,7 +150,6 @@
 
 .opencode-sessions-card-title {
   font-weight: var(--font-bold);
-  cursor: pointer;
 }
 
 .opencode-sessions-card-meta {
@@ -149,6 +166,11 @@
   font-family: var(--font-monospace);
 }
 
+.opencode-sessions-mono:hover {
+  color: var(--text-accent);
+  text-decoration: underline;
+}
+
 .opencode-sessions-badge {
   flex-shrink: 0;
   font-size: var(--font-smallest);
@@ -162,9 +184,16 @@
   background: color-mix(in srgb, var(--color-green) 12%, transparent);
 }
 
-.opencode-sessions-badge-suspended {
+.opencode-sessions-badge-suspended,
+.opencode-sessions-badge-waiting,
+.opencode-sessions-badge-interrupted {
   color: var(--color-orange);
   background: color-mix(in srgb, var(--color-orange) 12%, transparent);
+}
+
+.opencode-sessions-badge-error {
+  color: var(--color-red);
+  background: color-mix(in srgb, var(--color-red) 12%, transparent);
 }
 
 .opencode-sessions-badge-idle,
@@ -181,4 +210,327 @@
   color: var(--text-muted);
   font-family: var(--font-monospace);
   white-space: nowrap;
+}
+
+.opencode-sessions-id:hover {
+  color: var(--text-accent);
+}
+
+/* ---------------------------------------------------------------------------
+ * Session chat view
+ * ------------------------------------------------------------------------ */
+
+.opencode-session-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0.75rem 1rem 0.5rem;
+}
+
+.opencode-session-empty {
+  color: var(--text-muted);
+  padding: 2rem;
+}
+
+.oc-header {
+  flex: 0 0 auto;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.oc-header-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.oc-title {
+  font-weight: var(--font-bold);
+  font-size: var(--font-large);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.oc-header-row .opencode-sessions-badge {
+  flex-shrink: 0;
+}
+
+.oc-icon-button {
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: var(--font-smaller);
+}
+
+.oc-meta {
+  margin-top: 0.25rem;
+  font-size: var(--font-smaller);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.oc-offline {
+  margin-top: 0.35rem;
+  font-size: var(--font-smaller);
+  color: var(--color-orange);
+}
+
+/* THE trick: column-reverse flips the main axis, so the first DOM child is
+ * rendered at the BOTTOM. Content attaches to the end (bottom) of the chat
+ * by default — including when it is shorter than the viewport — and
+ * scrollTop 0 means "newest", so streaming growth stays pinned to the
+ * latest message without any scroll juggling. */
+.oc-chat {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 0.7rem;
+  padding: 0.75rem 0.25rem;
+}
+
+.oc-load-older {
+  align-self: center;
+  font-size: var(--font-smaller);
+}
+
+.oc-msg {
+  max-width: 92%;
+}
+
+.oc-msg-user {
+  align-self: flex-end;
+}
+
+.oc-msg-assistant,
+.oc-msg-system,
+.oc-msg-synthetic,
+.oc-msg-compaction,
+.oc-msg-skill,
+.oc-msg-shell,
+.oc-msg-agent-switched,
+.oc-msg-model-switched,
+.oc-msg-location-switched {
+  align-self: flex-start;
+  width: 92%;
+}
+
+.oc-bubble {
+  border-radius: var(--radius-m);
+  padding: 0.55rem 0.8rem;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.oc-bubble-user {
+  background: color-mix(in srgb, var(--interactive-accent) 16%, var(--background-secondary));
+  border: 1px solid color-mix(in srgb, var(--interactive-accent) 30%, transparent);
+}
+
+.oc-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.35rem;
+}
+
+.oc-chip {
+  font-size: var(--font-smallest);
+  font-family: var(--font-monospace);
+  padding: 0.05rem 0.4rem;
+  border-radius: var(--radius-s);
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+}
+
+.oc-msg-meta {
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+  margin-bottom: 0.2rem;
+}
+
+.oc-msg-agent {
+  color: var(--text-accent);
+  font-weight: var(--font-bold);
+}
+
+.oc-msg-pending {
+  color: var(--text-faint);
+  animation: oc-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes oc-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.oc-msg-error {
+  color: var(--color-red);
+  font-size: var(--font-smaller);
+  margin: 0.2rem 0;
+  overflow-wrap: anywhere;
+}
+
+.oc-text {
+  overflow-wrap: anywhere;
+}
+
+.oc-text.is-streaming {
+  white-space: pre-wrap;
+}
+
+.oc-reasoning {
+  border-left: 2px solid var(--background-modifier-border-hover);
+  padding-left: 0.6rem;
+  margin: 0.2rem 0;
+}
+
+.oc-reasoning summary {
+  color: var(--text-faint);
+  font-size: var(--font-smaller);
+  cursor: pointer;
+  user-select: none;
+}
+
+.oc-reasoning.is-streaming summary {
+  color: var(--text-muted);
+}
+
+.oc-reasoning-body {
+  font-size: var(--font-smaller);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding-top: 0.2rem;
+}
+
+.oc-tool {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  padding: 0.35rem 0.55rem;
+  margin: 0.3rem 0;
+  font-size: var(--font-smaller);
+}
+
+.oc-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.oc-tool-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.oc-tool-status.is-running {
+  color: var(--color-green);
+}
+
+.oc-tool.is-running .oc-tool-dot {
+  background: var(--color-green);
+  animation: oc-pulse 1.2s ease-in-out infinite;
+}
+
+.oc-tool.is-error .oc-tool-dot {
+  background: var(--color-red);
+}
+
+.oc-tool.is-done .oc-tool-dot {
+  background: var(--text-faint);
+}
+
+.oc-tool-status.is-done {
+  color: var(--text-faint);
+}
+
+.oc-tool-status.is-error {
+  color: var(--color-red);
+}
+
+.oc-tool-name {
+  font-family: var(--font-monospace);
+  font-weight: var(--font-bold);
+}
+
+.oc-tool-io summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.oc-tool-input,
+.oc-tool-output {
+  font-family: var(--font-monospace);
+  font-size: var(--font-smallest);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0.3rem 0 0;
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+.oc-note {
+  align-self: center;
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+  background: var(--background-secondary);
+  border-radius: var(--radius-s);
+  padding: 0.15rem 0.6rem;
+  max-width: 92%;
+  overflow-wrap: anywhere;
+}
+
+.oc-note-kind {
+  text-transform: capitalize;
+}
+
+.oc-composer {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.oc-input {
+  width: 100%;
+  resize: none;
+  font-family: var(--font-text);
+}
+
+.oc-composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.oc-hint {
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.oc-send {
+  margin-left: auto;
+}
+
+.oc-send,
+.oc-stop {
+  flex-shrink: 0;
+}
+
+.oc-stop:disabled,
+.oc-send:disabled {
+  opacity: 0.5;
 }
