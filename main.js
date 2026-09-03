@@ -477,22 +477,55 @@ class ServerEventStream {
     this.reconnectTimer = null;
     this.connecting = null;
     this.attempt = 0;
+    this.everConnected = false;
+    this.lifecycleAttached = false;
   }
 
   start() {
     if (this.started) return;
     this.started = true;
+    this.startLifecycleWatch();
     this.connect();
   }
 
   stop() {
     this.started = false;
+    this.stopLifecycleWatch();
     this.closeSource();
     if (this.reconnectTimer) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
     this.setConnected(false);
+  }
+
+  // Page inactive / sleep / network drop can silently kill SSE without an
+  // explicit error (throttled timers, dead sockets, missed heartbeats).
+  // Re-probe as soon as the page is visible again or the browser is online.
+  startLifecycleWatch() {
+    if (this.lifecycleAttached) return;
+    this.lifecycleAttached = true;
+    this.onVisibility = () => {
+      if (!this.started || document.visibilityState !== "visible") return;
+      if (!this.source || !this.connected) this.reconnectSoon(1);
+      else if (typeof this.plugin.refreshStaleSessions === "function") {
+        this.plugin.refreshStaleSessions("visible");
+      }
+    };
+    this.onOnline = () => {
+      if (this.started) this.reconnectSoon(1);
+    };
+    document.addEventListener("visibilitychange", this.onVisibility);
+    window.addEventListener("online", this.onOnline);
+  }
+
+  stopLifecycleWatch() {
+    if (!this.lifecycleAttached) return;
+    this.lifecycleAttached = false;
+    if (this.onVisibility) document.removeEventListener("visibilitychange", this.onVisibility);
+    if (this.onOnline) window.removeEventListener("online", this.onOnline);
+    this.onVisibility = null;
+    this.onOnline = null;
   }
 
   reconnectSoon(delayMs) {
@@ -539,8 +572,10 @@ class ServerEventStream {
     this.source = source;
     source.onopen = () => {
       this.attempt = 0;
+      // setConnected(true) drives syncActiveSessions + open-session
+      // reconcile via onStreamReconnected (covers first connect too,
+      // when views may have loaded from the offline SQLite fallback).
       this.setConnected(true);
-      this.plugin.syncActiveSessions();
     };
     source.onmessage = (message) => {
       let event = null;
@@ -566,6 +601,15 @@ class ServerEventStream {
     if (this.connected === value) return;
     this.connected = value;
     this.plugin.emitChange();
+    // Lost-then-recovered stream: views missed SSE deltas while offline,
+    // so force a full reconcile of every open session on every reconnect
+    // (first connect included — views may have rendered the DB fallback).
+    if (value) {
+      this.everConnected = true;
+      if (typeof this.plugin.onStreamReconnected === "function") {
+        this.plugin.onStreamReconnected();
+      }
+    }
   }
 }
 
@@ -848,6 +892,8 @@ class SessionChatView extends ItemView {
     this.unsubscribed = false;
     this.reconcileTimer = null;
     this.loadSeq = 0;
+    this.lastLoadedAt = 0;
+    this.refreshing = false;
   }
 
   getViewType() {
@@ -860,6 +906,27 @@ class SessionChatView extends ItemView {
 
   getIcon() {
     return "message-square";
+  }
+
+  // Persist across Obsidian reloads: workspace.json otherwise restores
+  // `"state": {}` and the tab keeps a stale title with no content.
+  // Obsidian calls setState() before onOpen() on restore.
+  getState() {
+    return { sessionId: this.sessionId, draftDirectory: this.draftDirectory };
+  }
+
+  async setState(state) {
+    if (state && typeof state === "object") {
+      if (typeof state.sessionId === "string" && state.sessionId) {
+        if (!this.sessionId) this.sessionId = state.sessionId;
+        if (!this.draftDirectory && typeof state.draftDirectory === "string") {
+          this.draftDirectory = state.draftDirectory || null;
+        }
+      } else if (typeof state.draftDirectory === "string" && state.draftDirectory) {
+        if (!this.sessionId) this.draftDirectory = state.draftDirectory;
+      }
+    }
+    return super.setState ? super.setState(state) : undefined;
   }
 
   setSession(sessionId) {
@@ -926,6 +993,8 @@ class SessionChatView extends ItemView {
         .then(() => new Notice("Copied session ID"))
         .catch(() => new Notice(this.sessionId));
     });
+    this.refreshButton = titleRow.createEl("button", { cls: "oc-icon-button oc-refresh", text: "Refresh" });
+    this.refreshButton.addEventListener("click", () => this.refresh(true));
     this.metaEl = header.createDiv({ cls: "oc-meta", text: "Loading…" });
     this.offlineEl = header.createDiv({ cls: "oc-offline", text: "" });
     this.offlineEl.style.display = "none";
@@ -1068,11 +1137,61 @@ class SessionChatView extends ItemView {
       this.setBusy(live?.status === "running" || live?.status === "waiting");
       this.renderHeader();
       this.renderBadge();
+      this.lastLoadedAt = Date.now();
     } catch (error) {
       if (this.unsubscribed || seq !== this.loadSeq) return;
       this.setOffline(true, error.message);
       await this.loadFromDb();
     }
+  }
+
+  // Manual + automatic refresh entry points (header button, tab focus,
+  // stream reconnect, layout-ready). Full reload when idle; non-destructive
+  // upsert when streaming so live deltas are not clobbered.
+  async refresh(manual = false) {
+    if (!this.sessionId || this.refreshing || this.unsubscribed) return;
+    if (this.isDraft()) return;
+    if (this.busy && !manual) {
+      await this.reconcileNow();
+      return;
+    }
+    this.refreshing = true;
+    if (this.refreshButton) {
+      this.refreshButton.disabled = true;
+      this.refreshButton.setText("Refreshing…");
+    }
+    try {
+      await this.loadInitial();
+    } finally {
+      this.refreshing = false;
+      if (this.refreshButton) {
+        this.refreshButton.disabled = false;
+        this.refreshButton.setText("Refresh");
+      }
+    }
+  }
+
+  // Called when the leaf becomes active (page load / tab switch back).
+  // Skips fresh views and live streams; reloads stale (>30s) or offline views.
+  async onBecameActive() {
+    await this.refreshIfStale();
+  }
+
+  async refreshIfStale(options = {}) {
+    const { force = false } = options;
+    if (!this.sessionId || this.refreshing || this.unsubscribed || this.isDraft()) return;
+    if (this.busy && !force) return;
+    const staleMs = Date.now() - (this.lastLoadedAt || 0);
+    if (!force && !this.offline && this.lastLoadedAt && staleMs < 30000) return;
+    await this.refresh(force);
+  }
+
+  // Stream was lost and recovered: SSE deltas in the gap are gone for good,
+  // so reconcile against the server immediately.
+  async refreshAfterReconnect() {
+    if (!this.sessionId || this.unsubscribed || this.isDraft()) return;
+    if (this.busy) await this.reconcileNow();
+    else await this.refresh(false);
   }
 
   // Offline fallback: session row + messages straight from SQLite.
@@ -1517,30 +1636,33 @@ class SessionChatView extends ItemView {
 
   scheduleReconcile() {
     if (this.reconcileTimer) window.clearTimeout(this.reconcileTimer);
-    this.reconcileTimer = window.setTimeout(async () => {
+    this.reconcileTimer = window.setTimeout(() => {
       this.reconcileTimer = null;
-      if (this.unsubscribed || this.offline) return;
-      try {
-        const limit = Math.max(DEFAULT_MESSAGE_PAGE, this.messages.size);
-        const response = await this.plugin.client.messages(this.sessionId, { limit, order: "asc" });
-        if (this.unsubscribed) return;
-        const previousFirst = this.order[0];
-        for (const message of response?.data || []) {
-          this.upsertMessage(message);
-        }
-        if (previousFirst) {
-          // New messages may have arrived on top; nothing else to do —
-          // upsertMessage prepends unknown ids at the bottom.
-        }
-        const sessionResponse = await this.plugin.client.session(this.sessionId).catch(() => null);
-        if (!this.unsubscribed && sessionResponse?.data) {
-          this.session = sessionResponse.data;
-          this.renderHeader();
-        }
-      } catch {
-        // ignore — the next event or manual refresh will retry
-      }
+      this.reconcileNow();
     }, 700);
+  }
+
+  // Non-destructive reconcile: upserts latest messages + session header
+  // without resetting the DOM (safe mid-stream, after reconnect, on focus).
+  async reconcileNow() {
+    if (this.unsubscribed || this.offline || !this.sessionId || this.isDraft()) return;
+    try {
+      const limit = Math.max(DEFAULT_MESSAGE_PAGE, this.messages.size);
+      const response = await this.plugin.client.messages(this.sessionId, { limit, order: "asc" });
+      if (this.unsubscribed) return;
+      for (const message of response?.data || []) {
+        this.upsertMessage(message);
+      }
+      const sessionResponse = await this.plugin.client.session(this.sessionId).catch(() => null);
+      if (!this.unsubscribed && sessionResponse?.data) {
+        this.session = sessionResponse.data;
+        this.renderHeader();
+      }
+      this.lastLoadedAt = Date.now();
+      if (this.offline) this.setOffline(false);
+    } catch {
+      // ignore — the next event or manual refresh will retry
+    }
   }
 
   async loadOlder() {
@@ -1989,6 +2111,25 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.addRibbonIcon("messages-square", "Open OpenCode sessions", () => this.activateView());
     this.addSettingTab(new OpenCodeSessionsSettingTab(this.app, this));
     this.configureRefreshTimer();
+    // (1) Refresh on page load / tab focus: Obsidian restores custom views
+    // without calling onOpen again, so an old tab would sit stale forever.
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        if (leaf && leaf.view instanceof SessionChatView) {
+          leaf.view.onBecameActive().catch(() => {});
+        } else if (leaf && leaf.view instanceof OpenCodeSessionsView) {
+          leaf.view.refresh().catch(() => {});
+        }
+      }),
+    );
+    this.app.workspace.onLayoutReady(() => {
+      this.refreshOpenSessions("layout-ready").catch(() => {});
+    });
+    this.addCommand({
+      id: "refresh-open-sessions",
+      name: "Refresh open sessions",
+      callback: () => this.refreshOpenSessions("manual"),
+    });
   }
 
   onunload() {
@@ -2108,6 +2249,48 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     }
   }
 
+  // (2) Stream lost then recovered: SSE deltas in the gap are unrecoverable,
+  // so reconcile every open session against the server + refresh the lists.
+  async onStreamReconnected() {
+    await this.syncActiveSessions();
+    await this.refreshOpenSessions("reconnect");
+  }
+
+  openSessionViews() {
+    try {
+      return this.app.workspace
+        .getLeavesOfType(VIEW_TYPE_SESSION)
+        .map((leaf) => leaf.view)
+        .filter((view) => view instanceof SessionChatView);
+    } catch {
+      return [];
+    }
+  }
+
+  async refreshOpenSessions(reason = "") {
+    const views = this.openSessionViews();
+    if (!views.length) {
+      this.emitChange();
+      return;
+    }
+    const force = reason === "reconnect" || reason === "layout-ready" || reason === "manual";
+    await Promise.all(
+      views.map((view) => {
+        if (reason === "reconnect") return view.refreshAfterReconnect().catch(() => {});
+        return view.refreshIfStale({ force }).catch(() => {});
+      }),
+    );
+    this.emitChange();
+  }
+
+  // Called when the page becomes visible while still connected: refresh
+  // tabs that went stale in the background (laptop sleep, throttled tab).
+  refreshStaleSessions() {
+    for (const view of this.openSessionViews()) {
+      view.refreshIfStale().catch(() => {});
+    }
+  }
+
   scheduleListRefresh() {
     if (this.listRefreshTimer) return;
     this.listRefreshTimer = window.setTimeout(() => {
@@ -2159,11 +2342,20 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       .find((leaf) => leaf.view instanceof SessionChatView && leaf.view.sessionId === sessionId);
     if (existing) {
       this.app.workspace.revealLeaf(existing);
+      // Previously this just revealed a potentially stale tab (missed SSE
+      // while elsewhere). Refresh stale/offline content on pick.
+      if (existing.view instanceof SessionChatView) {
+        existing.view.refreshIfStale().catch(() => {});
+      }
       return existing;
     }
     this.pendingSessionId = sessionId;
     const leaf = this.app.workspace.getLeaf("tab");
-    await leaf.setViewState({ type: VIEW_TYPE_SESSION, active: true });
+    await leaf.setViewState({
+      type: VIEW_TYPE_SESSION,
+      active: true,
+      state: { sessionId },
+    });
     this.app.workspace.revealLeaf(leaf);
     return leaf;
   }
@@ -2186,7 +2378,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
   async openSessionDraft(directory) {
     this.pendingDraftDirectory = directory;
     const leaf = this.app.workspace.getLeaf("tab");
-    await leaf.setViewState({ type: VIEW_TYPE_SESSION, active: true });
+    await leaf.setViewState({ type: VIEW_TYPE_SESSION, active: true, state: { draftDirectory: directory } });
     this.app.workspace.revealLeaf(leaf);
     return leaf;
   }
