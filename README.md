@@ -26,6 +26,10 @@ from `~/.local/state/opencode/service.json`, and reads the v2 SQLite database
 - **Prompt & stop**: send messages to a session (`POST /api/session/{id}/prompt`)
   and interrupt a running one (`POST /api/session/{id}/interrupt`) right from
   the composer.
+- **New sessions**: the *New OpenCode session* command (or the dashboard's
+  *New session* button) picks one of your configured directories — a single
+  directory is used automatically, several open a card picker — and starts a
+  draft chat; the server session is created with your first message.
 - Offline fallback: when the server is down, the chat shows the conversation
   read-only from `session_message` (input disabled).
 - Also exposes an API (`globalThis.opencodeSessions`) for e.g. Datacore JSX consumers.

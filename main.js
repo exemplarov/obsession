@@ -8,6 +8,7 @@ const { execFile } = require("child_process");
 
 const VIEW_TYPE_SESSIONS = "opencode-sessions-view";
 const VIEW_TYPE_SESSION = "opencode-session-view";
+const VIEW_TYPE_NEW_SESSION = "opencode-new-session-view";
 const BLOCK_LANGUAGE = "opencode-sessions";
 const DEFAULT_REFRESH_SECONDS = 30;
 const DEFAULT_PAGE_SIZE = 10;
@@ -618,6 +619,10 @@ class SessionsDashboard {
     });
     const refreshButton = toolbar.createEl("button", { text: "Refresh" });
     refreshButton.addEventListener("click", () => this.load());
+    const newButton = toolbar.createEl("button", { text: "New session" });
+    newButton.addEventListener("click", () =>
+      this.plugin.newSession({ dirs: this.options.dirs, basedir: this.options.basedir }),
+    );
     if (this.options.showSettings) {
       const settingsButton = toolbar.createEl("button", { text: "Settings" });
       settingsButton.addEventListener("click", () => this.plugin.openSettings());
@@ -827,6 +832,10 @@ class SessionChatView extends ItemView {
     this.plugin = plugin;
     this.sessionId = plugin.pendingSessionId || null;
     plugin.pendingSessionId = null;
+    // Draft mode: a not-yet-created session in this directory; the server
+    // session is created lazily when the first message is sent.
+    this.draftDirectory = plugin.pendingDraftDirectory || null;
+    plugin.pendingDraftDirectory = null;
     this.session = null;
     this.offline = false;
     this.busy = false;
@@ -860,16 +869,32 @@ class SessionChatView extends ItemView {
   async onOpen() {
     this.contentEl.empty();
     this.contentEl.addClass("opencode-session-view");
-    if (!this.sessionId) {
-      this.contentEl.createDiv({ cls: "opencode-session-empty", text: "No session selected." });
+    if (this.sessionId) {
+      this.buildSkeleton();
+      this.bindSession(this.sessionId);
+      this.unsubscribeStream = this.plugin.subscribe(() => this.updateComposer());
+      await this.loadInitial();
       return;
     }
-    this.buildSkeleton();
-    this.unsubscribeEvents = this.plugin.subscribeSession(this.sessionId, (event) =>
+    if (this.draftDirectory) {
+      this.buildSkeleton();
+      this.unsubscribeStream = this.plugin.subscribe(() => this.updateComposer());
+      this.renderHeader();
+      this.renderBadge();
+      this.updateComposer();
+      return;
+    }
+    this.contentEl.createDiv({ cls: "opencode-session-empty", text: "No session selected." });
+  }
+
+  // (Re)wires the per-session event listener; used on open and again when a
+  // draft is promoted to a real session on the server.
+  bindSession(sessionId) {
+    if (this.unsubscribeEvents) this.unsubscribeEvents();
+    this.sessionId = sessionId;
+    this.unsubscribeEvents = this.plugin.subscribeSession(sessionId, (event) =>
       this.onServerEvent(event),
     );
-    this.unsubscribeStream = this.plugin.subscribe(() => this.updateComposer());
-    await this.loadInitial();
   }
 
   async onClose() {
@@ -956,15 +981,21 @@ class SessionChatView extends ItemView {
     this.sendButton.disabled = !!this.offline || !this.inputEl?.value?.trim();
     this.stopButton.disabled = !!this.offline || !this.busy;
     this.stopButton.style.display = "";
-    this.hintEl.setText(
-      this.offline
-        ? "Offline — input disabled"
-        : this.busy
-          ? "Streaming… new messages attach at the bottom; Stop interrupts"
-          : connected
-            ? "Live — connected to the OpenCode v2 event stream"
-            : "Reconnecting…",
-    );
+    if (this.offline) {
+      this.hintEl.setText("Offline — input disabled");
+    } else if (this.isDraft()) {
+      this.hintEl.setText("Draft — your first message will create the session");
+    } else if (this.busy) {
+      this.hintEl.setText("Streaming… new messages attach at the bottom; Stop interrupts");
+    } else if (connected) {
+      this.hintEl.setText("Live — connected to the OpenCode v2 event stream");
+    } else {
+      this.hintEl.setText("Reconnecting…");
+    }
+  }
+
+  isDraft() {
+    return !this.sessionId && !!this.draftDirectory;
   }
 
   setBusy(busy, outcome = "") {
@@ -975,6 +1006,11 @@ class SessionChatView extends ItemView {
   }
 
   renderBadge() {
+    if (!this.sessionId) {
+      this.badgeEl.className = `opencode-sessions-badge ${this.isDraft() ? "oc-picker-draft" : "opencode-sessions-badge-none"}`;
+      this.badgeEl.setText(this.isDraft() ? "New" : "");
+      return;
+    }
     const live = this.plugin.getLiveState(this.sessionId);
     const state = this.busy ? "running" : live && live.status !== "running" ? live.status : "idle";
     this.badgeEl.className = `opencode-sessions-badge opencode-sessions-badge-${state}`;
@@ -982,7 +1018,20 @@ class SessionChatView extends ItemView {
   }
 
   renderHeader() {
-    if (!this.session) return;
+    if (!this.session) {
+      if (this.isDraft()) {
+        this.titleEl.setText("New session");
+        this.metaEl.setText(
+          [
+            `Draft in ${this.draftDirectory}`,
+            this.draftDirectory === this.plugin.vaultRoot
+              ? "this vault"
+              : displayDirectory(this.draftDirectory, this.plugin.vaultRoot),
+          ].join(" · "),
+        );
+      }
+      return;
+    }
     this.titleEl.setText(this.session.title || "Untitled session");
     const model = this.session.model ? modelLabel(this.session.model) : "";
     const tokens = formatTokens(this.session.tokens);
@@ -1541,6 +1590,10 @@ class SessionChatView extends ItemView {
     if (this.offline) return;
     const text = this.inputEl.value.trim();
     if (!text) return;
+    if (this.isDraft()) {
+      await this.sendDraft(text);
+      return;
+    }
     this.inputEl.value = "";
     this.autoGrow();
     this.updateComposer();
@@ -1562,8 +1615,40 @@ class SessionChatView extends ItemView {
     this.updateComposer();
   }
 
+  // Drafts create the server session lazily with the first message, so no
+  // empty sessions pile up when a draft is abandoned.
+  async sendDraft(text) {
+    try {
+      const created = await this.plugin.client.request("/api/session", {
+        method: "POST",
+        body: { location: { directory: this.draftDirectory } },
+      });
+      const session = created?.data;
+      if (!session?.id) throw new Error("server returned no session id");
+      this.draftDirectory = null;
+      this.session = session;
+      this.bindSession(session.id);
+      this.renderHeader();
+      this.renderBadge();
+      this.inputEl.value = "";
+      this.autoGrow();
+      const response = await this.plugin.client.prompt(session.id, text);
+      const user = response?.data;
+      this.upsertMessage({
+        id: user?.id || `local-${Date.now()}`,
+        type: "user",
+        time: { created: user?.timeCreated || Date.now() },
+        text: user?.payload?.text || text,
+      });
+      this.setBusy(true);
+    } catch (error) {
+      new Notice(`Could not create session: ${error.message}`);
+    }
+    this.updateComposer();
+  }
+
   async stop() {
-    if (this.offline) return;
+    if (this.offline || !this.sessionId) return;
     try {
       const response = await this.plugin.client.interrupt(this.sessionId);
       if (response && response.interrupted) {
@@ -1571,6 +1656,75 @@ class SessionChatView extends ItemView {
       }
     } catch (error) {
       new Notice(`Stop failed: ${error.message}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// New-session directory picker: card list of the configured working
+// directories; picking one opens a draft chat in a new tab.
+// ---------------------------------------------------------------------------
+
+class NewSessionView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.directories = plugin.pendingPickerDirectories || null;
+    plugin.pendingPickerDirectories = null;
+  }
+
+  getViewType() {
+    return VIEW_TYPE_NEW_SESSION;
+  }
+
+  getDisplayText() {
+    return "New OpenCode session";
+  }
+
+  getIcon() {
+    return "plus";
+  }
+
+  setDirectories(directories) {
+    this.directories = directories;
+    if (this.contentEl) this.render();
+  }
+
+  async onOpen() {
+    this.contentEl.empty();
+    this.contentEl.addClass("opencode-new-session-view");
+    this.render();
+  }
+
+  render() {
+    const { contentEl } = this;
+    if (!this.directories) return;
+    contentEl.empty();
+    const header = contentEl.createDiv({ cls: "oc-picker-header" });
+    header.createEl("h2", { text: "New OpenCode session" });
+    header.createDiv({
+      cls: "oc-picker-sub",
+      text: "Pick a working directory — the session is created when you send the first message.",
+    });
+    const cards = contentEl.createDiv({ cls: "opencode-sessions-cards" });
+    for (const directory of this.directories) {
+      const card = cards.createDiv({ cls: "opencode-sessions-card" });
+      card.addEventListener("click", () => this.plugin.openSessionDraft(directory));
+      const head = card.createDiv({ cls: "opencode-sessions-card-head" });
+      const titleWrap = head.createSpan({ cls: "oc-picker-title" });
+      setIcon(titleWrap.createSpan({ cls: "oc-picker-icon" }), "folder");
+      titleWrap.createSpan({
+        cls: "opencode-sessions-card-title",
+        text: directory === this.plugin.vaultRoot ? "This vault" : path.basename(directory) || directory,
+      });
+      card.createDiv({
+        cls: "opencode-sessions-card-meta",
+        text: displayDirectory(directory, this.plugin.vaultRoot),
+      });
+      card.createDiv({
+        cls: "opencode-sessions-card-sub",
+        text: directory,
+      });
     }
   }
 }
@@ -1768,6 +1922,8 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.liveStates = new Map();
     this.listRefreshTimer = null;
     this.pendingSessionId = null;
+    this.pendingDraftDirectory = null;
+    this.pendingPickerDirectories = null;
 
     this.client = new OpenCodeClient(this);
     this.serverEvents = new ServerEventStream(this);
@@ -1807,6 +1963,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
 
     this.registerView(VIEW_TYPE_SESSIONS, (leaf) => new OpenCodeSessionsView(leaf, this));
     this.registerView(VIEW_TYPE_SESSION, (leaf) => new SessionChatView(leaf, this));
+    this.registerView(VIEW_TYPE_NEW_SESSION, (leaf) => new NewSessionView(leaf, this));
     // Note-embeddable dashboards: ```opencode-sessions blocks render the same
     // dashboard as the view, configured by the block body.
     this.registerMarkdownCodeBlockProcessor(BLOCK_LANGUAGE, (source, el, ctx) => {
@@ -1823,6 +1980,11 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       id: "open-sessions",
       name: "Open OpenCode sessions",
       callback: () => this.activateView(),
+    });
+    this.addCommand({
+      id: "new-session",
+      name: "New OpenCode session",
+      callback: () => this.newSession(),
     });
     this.addRibbonIcon("messages-square", "Open OpenCode sessions", () => this.activateView());
     this.addSettingTab(new OpenCodeSessionsSettingTab(this.app, this));
@@ -2006,6 +2168,42 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     return leaf;
   }
 
+  // New-session flow: single configured directory goes straight to a draft
+  // chat; several open the directory picker.
+  async newSession(options = {}) {
+    const { directories } = this.resolveDirectories(options);
+    if (!directories.length) {
+      new Notice("No directories configured — add them in OpenCode Sessions settings.");
+      return;
+    }
+    if (directories.length === 1) {
+      await this.openSessionDraft(directories[0]);
+      return;
+    }
+    await this.activateNewSessionPicker(directories);
+  }
+
+  async openSessionDraft(directory) {
+    this.pendingDraftDirectory = directory;
+    const leaf = this.app.workspace.getLeaf("tab");
+    await leaf.setViewState({ type: VIEW_TYPE_SESSION, active: true });
+    this.app.workspace.revealLeaf(leaf);
+    return leaf;
+  }
+
+  async activateNewSessionPicker(directories) {
+    let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_NEW_SESSION)[0];
+    if (leaf && leaf.view instanceof NewSessionView) {
+      leaf.view.setDirectories(directories);
+    } else {
+      this.pendingPickerDirectories = directories;
+      leaf = this.app.workspace.getLeaf("tab");
+      await leaf.setViewState({ type: VIEW_TYPE_NEW_SESSION, active: true });
+    }
+    this.app.workspace.revealLeaf(leaf);
+    return leaf;
+  }
+
   openSettings() {
     this.app.setting.open();
     this.app.setting.openTabById(this.manifest.id);
@@ -2013,12 +2211,8 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
 
   // ----- SQLite listing (works without the server) ---------------------------
 
-  async loadSessions(options = {}) {
-    if (!fs.existsSync(this.settings.databasePath)) {
-      throw new Error(`Database not found: ${this.settings.databasePath}`);
-    }
-
-    const table = "session_v2";
+  // Normalizes directory options shared by listing and new-session picking.
+  resolveDirectories(options = {}) {
     const requestedDirectories = options.dirs !== undefined
       ? options.dirs
       : options.directories !== undefined
@@ -2036,6 +2230,16 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       .filter(Boolean)
       .map((directory) => (basedir && !path.isAbsolute(directory) ? path.join(basedir, directory) : directory))
       .map((directory) => path.normalize(directory)))];
+    return { basedir, directories };
+  }
+
+  async loadSessions(options = {}) {
+    if (!fs.existsSync(this.settings.databasePath)) {
+      throw new Error(`Database not found: ${this.settings.databasePath}`);
+    }
+
+    const table = "session_v2";
+    const { basedir, directories } = this.resolveDirectories(options);
     if (!directories.length) return [];
     const directoryList = directories.map(quoteSql).join(", ");
     const tableExists = await runSqlite(

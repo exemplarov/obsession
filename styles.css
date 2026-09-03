@@ -232,6 +232,38 @@
   padding: 2rem;
 }
 
+/* New-session directory picker */
+.opencode-new-session-view {
+  padding: 1rem;
+}
+
+.oc-picker-header h2 {
+  margin: 0 0 0.25rem;
+}
+
+.oc-picker-sub {
+  color: var(--text-muted);
+  font-size: var(--font-smaller);
+  margin-bottom: 0.75rem;
+}
+
+.oc-picker-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.oc-picker-icon {
+  color: var(--text-accent);
+  display: inline-flex;
+}
+
+.opencode-sessions-badge-none.oc-picker-draft {
+  color: var(--color-blue);
+  background: color-mix(in srgb, var(--color-blue) 12%, transparent);
+}
+
 .oc-header {
   flex: 0 0 auto;
   padding-bottom: 0.5rem;
