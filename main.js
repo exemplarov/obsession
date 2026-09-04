@@ -515,18 +515,24 @@ class OpenCodeClient {
     const overrideUrl = String(settings.apiBaseUrl || "").trim().replace(/\/+$/, "");
     const overridePassword = String(settings.apiPassword || "").trim();
     const candidates = [];
-    if (overrideUrl) candidates.push({ baseUrl: overrideUrl, password: overridePassword });
-    const registration = readJsonFile(serviceRegistrationFile());
-    if (registration && registration.url) {
-      candidates.push({
-        baseUrl: String(registration.url).replace(/\/+$/, ""),
-        password: overridePassword || String(registration.password || ""),
-      });
+    if (overrideUrl) {
+      // An explicit URL is authoritative: no silent fallback to a local
+      // server when the remote one is unreachable (multi-connector setups
+      // would otherwise collapse two connectors onto one server).
+      candidates.push({ baseUrl: overrideUrl, password: overridePassword, override: true });
+    } else {
+      const registration = readJsonFile(serviceRegistrationFile());
+      if (registration && registration.url) {
+        candidates.push({
+          baseUrl: String(registration.url).replace(/\/+$/, ""),
+          password: overridePassword || String(registration.password || ""),
+        });
+      }
+      const config = readJsonFile(serviceConfigFile());
+      const fallbackPassword = overridePassword || String((config && config.password) || "");
+      candidates.push({ baseUrl: "http://127.0.0.1:49374", password: fallbackPassword });
+      candidates.push({ baseUrl: "http://127.0.0.1:4096", password: fallbackPassword });
     }
-    const config = readJsonFile(serviceConfigFile());
-    const fallbackPassword = overridePassword || String((config && config.password) || "");
-    candidates.push({ baseUrl: "http://127.0.0.1:49374", password: fallbackPassword });
-    candidates.push({ baseUrl: "http://127.0.0.1:4096", password: fallbackPassword });
     for (const candidate of candidates) {
       const health = await OpenCodeClient.probe(candidate.baseUrl, candidate.password);
       if (health) {
@@ -536,7 +542,11 @@ class OpenCodeClient {
         return candidate;
       }
     }
-    throw new Error("OpenCode v2 server not found (no /api/health responded)");
+    throw new Error(
+      overrideUrl
+        ? `OpenCode v2 server not reachable at ${overrideUrl}`
+        : "OpenCode v2 server not found (no /api/health responded)",
+    );
   }
 
   async request(pathname, options = {}) {
@@ -575,6 +585,13 @@ class OpenCodeClient {
 
   session(sessionId) {
     return this.request(`/api/session/${encodeURIComponent(sessionId)}`);
+  }
+
+  // Full session list (used when the local database is unavailable — e.g.
+  // remote servers). Each item: id, title, agent, model, cost, tokens,
+  // time{created,updated,…}, location{directory}.
+  listSessions() {
+    return this.request("/api/session", { timeoutMs: 20000 });
   }
 
   messages(sessionId, options = {}) {
@@ -877,7 +894,7 @@ class OpenCode2Driver extends ConnectorDriver {
 
   capabilities() {
     return {
-      listing: "db", // API-based listing arrives with remote connectors
+      listing: this.databaseUsable() ? "db" : "api",
       live: "sse",
       messages: true,
       pagination: true,
@@ -956,18 +973,73 @@ class OpenCode2Driver extends ConnectorDriver {
     }
   }
 
-  // ----- listing (SQLite session_v2; works without the server) ---------------
+  // ----- listing ---------------------------------------------------------------
+
+  // DB listing when enabled and present; API listing otherwise (remote
+  // servers, or the database file moved away).
+  databaseUsable() {
+    return !!this.config.useDatabase && fs.existsSync(this.config.databasePath);
+  }
 
   async listSessions(options = {}) {
-    const settings = this.config;
-    if (!settings.useDatabase) {
-      // API-only listing lands with remote connectors (Phase 2).
-      throw new Error("Database listing is disabled for this connector (API-only mode arrives with remote connectors).");
-    }
-    if (!fs.existsSync(settings.databasePath)) {
-      throw new Error(`Database not found: ${settings.databasePath}`);
-    }
+    if (this.databaseUsable()) return this.listSessionsFromDb(options);
+    return this.listSessionsFromApi(options);
+  }
 
+  async listSessionsFromApi(options = {}) {
+    const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector);
+    const response = await this.client.listSessions();
+    const list = Array.isArray(response?.data) ? response.data : [];
+    const wanted = new Set(directories.map((directory) => path.normalize(directory)));
+    const rows = list
+      .filter((session) => {
+        // Explicit id lookups bypass the directory filter entirely.
+        if (options.allDirectories) return true;
+        // Parity with the DB path: no configured directories → no rows.
+        if (!wanted.size) return false;
+        const directory = session?.location?.directory || "";
+        return wanted.has(path.normalize(directory));
+      })
+      .map((session) => this.apiSessionRow(session, basedir));
+    return rows.sort((a, b) => Number(b.time_updated || 0) - Number(a.time_updated || 0));
+  }
+
+  // Maps a /api/session item onto the decorated row shape the dashboards
+  // consume (same fields as the session_v2 SQL rows).
+  apiSessionRow(session, basedir) {
+    const tokens = session.tokens && typeof session.tokens === "object" ? session.tokens : {};
+    return this.plugin.decorateRow(
+      {
+        id: session.id,
+        directory: session.location?.directory || "",
+        title: session.title || null,
+        agent: session.agent || "",
+        model: session.model || null,
+        time_created: session.time?.created || null,
+        time_updated: session.time?.updated || null,
+        time_archived: null,
+        time_suspended: null,
+        version: null,
+        cost: session.cost || 0,
+        tokens_input: tokens.input || 0,
+        tokens_output: tokens.output || 0,
+        tokens_reasoning: tokens.reasoning || 0,
+        // API rows carry no fallback-state hints; the event stream (or idle)
+        // decides. Note: this beta API exposes time.idle but NOT the
+        // suspend timestamp, so API rows never report "Suspended".
+        last_assistant_time: null,
+        last_assistant_completed: null,
+        last_message_type: null,
+        connectorId: this.connector.id,
+        connectorName: this.connector.name,
+        source: "opencode2",
+      },
+      basedir,
+    );
+  }
+
+  async listSessionsFromDb(options = {}) {
+    const settings = this.config;
     const table = "session_v2";
     const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector);
     if (!directories.length) return [];
@@ -1048,8 +1120,19 @@ class OpenCode2Driver extends ConnectorDriver {
   }
 
   // Rows for explicitly pinned session ids (widget mode); preserves the
-  // given order and reports ids that no longer exist.
+  // given order and reports ids that no longer exist. Falls back to the
+  // API list when the database is unavailable.
   async loadSessionRowsByIds(ids) {
+    if (!this.databaseUsable()) {
+      // Explicit ids bypass the directory filter; errors propagate so the
+      // dashboard can distinguish "unreachable" from "deleted".
+      const rows = await this.listSessionsFromApi({ allDirectories: true });
+      const byId = new Map(rows.map((row) => [row.id, row]));
+      return {
+        rows: ids.map((id) => byId.get(id)).filter(Boolean),
+        missing: ids.filter((id) => !byId.has(id)),
+      };
+    }
     const rows = [];
     const missing = [];
     for (const id of ids) {
@@ -1345,19 +1428,12 @@ class SessionsDashboard {
       this.render();
       return;
     }
-    const pinnedIds = this.pinnedSessionIds();
-    let pinnedRows = [];
-    let missingRows = [];
-    if (pinnedIds.length) {
-      try {
+    try {
+      if (pinnedIds.length) {
         const { rows, missing } = await driver.loadSessionRowsByIds(pinnedIds);
         pinnedRows = rows;
         missingRows = missing.map((id) => this.plugin.missingSessionRow(id, this.connectorEntry));
-      } catch {
-        missingRows = pinnedIds.map((id) => this.plugin.missingSessionRow(id, this.connectorEntry));
       }
-    }
-    try {
       if (this.sessionsOnlyMode()) {
         this.sessions = [...pinnedRows, ...missingRows];
       } else {
@@ -1795,7 +1871,14 @@ class SessionChatView extends ItemView {
 
   setOffline(offline, reason = "") {
     this.offline = offline;
-    this.offlineEl.setText(offline ? `Server unreachable${reason ? ` — ${reason}` : ""}. Showing messages from the local database (read-only).` : "");
+    const prefix = `Server unreachable${reason ? ` — ${reason}` : ""}`;
+    this.offlineEl.setText(
+      offline
+        ? this.driver?.databaseUsable()
+          ? `${prefix}. Showing messages from the local database (read-only).`
+          : `${prefix}. History is unavailable until the server returns.`
+        : "",
+    );
     this.offlineEl.style.display = offline ? "" : "none";
     this.updateComposer();
   }
@@ -3038,12 +3121,15 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
       try {
         const { detail } = await currentDriver.health();
         const endpoint = currentDriver.client.endpoint;
+        const overrideMark = endpoint?.override ? " (override)" : "";
         statusEl.setText(
-          `Connected${endpoint ? ` to ${endpoint.baseUrl}` : ""} — ${detail}. Event stream: ${currentDriver.streamConnected() ? "live" : "connecting…"}`,
+          `Connected${endpoint ? ` to ${endpoint.baseUrl}` : ""}${overrideMark} — ${detail}. Event stream: ${currentDriver.streamConnected() ? "live" : "connecting…"}. Listing: ${currentDriver.databaseUsable() ? "SQLite" : "API"}.`,
         );
       } catch {
         statusEl.setText(
-          "Server unreachable — dashboards fall back to SQLite polling; chat and input are disabled until it returns.",
+          currentDriver.databaseUsable()
+            ? "Server unreachable — dashboards fall back to SQLite polling; chat and input are disabled until it returns."
+            : "Server unreachable — this connector has no local database; listing and chat are unavailable until it returns.",
         );
       }
     };
@@ -3067,7 +3153,9 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Server URL override")
-      .setDesc("Leave empty to auto-discover via ~/.local/state/opencode/service.json (recommended).")
+      .setDesc(
+        "Leave empty to auto-discover the local server via ~/.local/state/opencode/service.json (recommended). Set a URL (e.g. http://host:49374) for a remote OpenCode v2 server — listing then comes from its API unless the database below is also enabled and reachable.",
+      )
       .addText((text) =>
         text
           .setPlaceholder("http://127.0.0.1:49374")
@@ -3093,6 +3181,45 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Use local database (SQLite)")
+      .setDesc(
+        "List sessions from opencode.db — works even when the server is unreachable. Disable for remote servers whose database is not on this machine; listing then uses the API.",
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(!!config.useDatabase).onChange(async (value) => {
+          config.useDatabase = value;
+          await plugin.saveSettings();
+          this.display();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Directories")
+      .setDesc("One OpenCode working directory per line. Add historical aliases if needed.")
+      .addTextArea((text) => {
+        text
+          .setValue(config.directories.join("\n"))
+          .onChange(async (value) => {
+            config.directories = value
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+            await plugin.saveSettings();
+          });
+        text.inputEl.rows = 5;
+        text.inputEl.style.width = "100%";
+      });
+
+    if (!config.useDatabase) {
+      const note = containerEl.createDiv({
+        cls: "opencode-sessions-status",
+        text: "API listing mode: sessions come from the server's /api/session endpoint (custom SQL does not apply).",
+      });
+      note.style.marginBottom = "0.5rem";
+      return;
+    }
+
+    new Setting(containerEl)
       .setName("OpenCode database")
       .setDesc("Read-only SQLite database used by OpenCode v2 (session_v2).")
       .addText((text) =>
@@ -3115,23 +3242,6 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
             await plugin.saveSettings();
           }),
       );
-
-    new Setting(containerEl)
-      .setName("Directories")
-      .setDesc("One OpenCode working directory per line. Add historical aliases if needed.")
-      .addTextArea((text) => {
-        text
-          .setValue(config.directories.join("\n"))
-          .onChange(async (value) => {
-            config.directories = value
-              .split(/\r?\n/)
-              .map((line) => line.trim())
-              .filter(Boolean);
-            await plugin.saveSettings();
-          });
-        text.inputEl.rows = 5;
-        text.inputEl.style.width = "100%";
-      });
 
     new Setting(containerEl)
       .setName("Custom SQL")
