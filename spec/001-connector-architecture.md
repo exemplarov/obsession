@@ -157,13 +157,18 @@ plugin.registry
   ├─ byName(name) → Connector
   ├─ get(idOrName) → Connector
   ├─ defaultConnector() → Connector|null    // defaultConnectorId → first enabled
-  ├─ rebuild()                              // diff configs → create/dispose drivers
   ├─ listSessions(query) / …                // routed calls, error-isolated (§5.4)
   └─ status listeners (settings UI, dashboards)
 ```
 
-- `rebuild()` runs on every settings save; unchanged connectors (same config
-  hash) keep their driver instance (no SSE reconnect churn).
+- **Note (implementation deviation, accepted):** there is no `rebuild()`
+  with config-hash diffing — settings edits mutate the shared
+  connector/config objects that drivers hold references to, so field edits
+  apply live without recreating drivers (no SSE reconnect churn while
+  typing). Only add/delete and enable/disable touch the registry. Connection
+  fields (URL/password) restart their driver explicitly.
+- Per-connector status recording (`status.lastError`) is deferred; views
+  catch and surface their own errors per dashboard/chat today.
 - Registry owns per-connector lifecycles: OpenCode v2 connectors each get
   their own `OpenCodeClient` + `ServerEventStream`; file connectors get a
   shared `DirWatcher` (fs.watch with recursive flag where available, polling
@@ -360,7 +365,7 @@ Version 4, additive; v3 shapes keep working when only the default connector
 is involved:
 
 ```js
-api.connectors()                    // [{ id, name, kind, enabled, capabilities, status }]
+api.connectors()                    // [{ id, name, kind, enabled, capabilities }]
 api.connector(name)                 // namespace bound to one connector
   .list(query) .messages(id, opts) .prompt(id, text) .stop(id) .health()
 api.list(query)                     // default connector (v3 behavior)

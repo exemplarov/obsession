@@ -3476,17 +3476,15 @@ class SessionChatView extends ItemView {
 
   setOffline(offline, reason = "") {
     this.offline = offline;
-    let detail;
-    if (this.driver instanceof FileConnectorDriver) {
-      detail = `Could not read this session's transcript${reason ? ` — ${reason}` : ""}. It may have been moved, deleted, or is too large; retrying.`;
-    } else if (this.driver instanceof OpenCode1Driver) {
-      detail = `Could not read the v1 database${reason ? ` — ${reason}` : ""}. Check the connector's database path and sqlite3 setting.`;
-    } else {
-      detail = `Server unreachable${reason ? ` — ${reason}` : ""}`;
-    }
+    const detail = this.driver instanceof FileConnectorDriver
+      ? `Could not read this session's transcript${reason ? ` — ${reason}` : ""}. It may have been moved, deleted, or is too large; retrying.`
+      : this.driver instanceof OpenCode1Driver
+        ? `Could not read the v1 database${reason ? ` — ${reason}` : ""}. Check the connector's database path and sqlite3 setting.`
+        : `Server unreachable${reason ? ` — ${reason}` : ""}`;
+    const hasDbFallback = typeof this.driver?.databaseUsable === "function" && this.driver.databaseUsable();
     this.offlineEl.setText(
       offline
-        ? this.driver?.databaseUsable()
+        ? hasDbFallback
           ? `${detail}. Showing messages from the local database (read-only).`
           : `${detail}.`
         : "",
@@ -4791,7 +4789,8 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
           if (currentDriver instanceof OpenCode2Driver) {
             const endpoint = currentDriver.client.endpoint;
             const overrideMark = endpoint?.override ? " (override)" : "";
-            endpointLine = `${endpoint ? ` to ${endpoint.baseUrl}` : ""}${overrideMark} — ${detail}. Event stream: ${currentDriver.streamConnected() ? "live" : "connecting…"}. Listing: ${currentDriver.databaseUsable() ? "SQLite" : "API"}.`;
+            const dbUsable = typeof currentDriver.databaseUsable === "function" && currentDriver.databaseUsable();
+            endpointLine = `${endpoint ? ` to ${endpoint.baseUrl}` : ""}${overrideMark} — ${detail}. Event stream: ${currentDriver.streamConnected() ? "live" : "connecting…"}. Listing: ${dbUsable ? "SQLite" : "API"}.`;
           } else {
             endpointLine = ` — ${detail}. Read-only; refreshed on interval.`;
           }
@@ -4799,7 +4798,7 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
         }
       } catch {
         statusEl.setText(
-          currentDriver.databaseUsable()
+          typeof currentDriver.databaseUsable === "function" && currentDriver.databaseUsable()
             ? "Server unreachable — dashboards fall back to SQLite polling; chat and input are disabled until it returns."
             : "Server unreachable — this connector has no local database; listing and chat are unavailable until it returns.",
         );

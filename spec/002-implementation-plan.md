@@ -231,5 +231,5 @@ tool parts render; v2 connector on the same DB file unaffected.
   connector must degrade to "listing only" if message parsing fails.
 - Claude/Cursor slug decoding is lossy; the configured-dirs matching is a
   heuristic — surfaced as a docs caveat, not silently wrong paths.
-- Keep `source`/`databaseKind` back-compat in `config()` output for
-  Datacore/JSX consumers.
+- Keep `source` on decorated rows (backend kind) for Datacore/JSX consumers;
+  the v0.7 `databaseKind` *setting* is gone — v1 is its own connector kind.

@@ -85,7 +85,7 @@ Options (simple `key: value` lines or a JSON object):
 | Option | Default | Description |
 | --- | --- | --- |
 | `connector` | default connector | Connector **name** (e.g. `claude`, `codex-2`). Unknown names render an inline error. |
-| `dirs` | connector setting | Directories to list sessions for. Relative entries resolve against `basedir`. |
+| `dirs` | connector setting | Directories to list sessions for. Relative entries resolve against `basedir`. On OpenCode connectors this **overrides** the connector's configured directories; on Claude/Codex/Cursor it **adds to** them (a filter). |
 | `sessions` | – | Explicit session ids (list). With **only** `sessions` the block renders a clean widget: just the cards, no toolbar. Missing ids render as dashed "(not found)" cards. |
 | `basedir` | – | Prefix for relative `dirs`; cards/tables show directories relative to it. |
 | `layout` | `cards` | `cards` or `table`. |
