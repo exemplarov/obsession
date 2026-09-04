@@ -315,6 +315,57 @@
   min-width: 0;
 }
 
+.oc-connector-chip {
+  flex-shrink: 0;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  background: var(--background-modifier-hover);
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  white-space: nowrap;
+}
+
+/* Connector cards (settings) */
+.opencode-connector-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 0.75rem 0.75rem 0.25rem;
+  margin: 0.75rem 0;
+}
+
+.opencode-connector-card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.opencode-connector-kind {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.opencode-connector-name {
+  width: 12rem;
+}
+
+.opencode-connector-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: auto;
+}
+
+.opencode-connector-toggle-label {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+
+.opencode-connector-card .opencode-sessions-status {
+  margin: 0.5rem 0 0.25rem;
+}
+
 .oc-header-row .opencode-sessions-badge {
   flex-shrink: 0;
 }

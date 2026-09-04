@@ -29,6 +29,140 @@ const STATE_LABELS = {
   "": "",
 };
 
+// ---------------------------------------------------------------------------
+// Connectors. A connector is one named instance of a backend — the local
+// OpenCode v2 install (default, zero-config), a remote v2 server, or (later)
+// local transcript backends like Claude Code / Codex / Cursor. Connectors are
+// named (unique, editable); widgets and links reference them by name.
+// ---------------------------------------------------------------------------
+
+const CONNECTOR_KINDS = {
+  opencode2: {
+    id: "opencode2",
+    label: "OpenCode v2",
+    baseName: "opencode",
+    createConfig: () => ({
+      apiBaseUrl: "",
+      apiPassword: "",
+      useDatabase: true,
+      databasePath: defaultDatabasePath(),
+      sqlitePath: defaultSqlitePath(),
+      directories: [],
+      customSql: "",
+    }),
+  },
+};
+
+function newConnectorId() {
+  const random = Math.random().toString(36).slice(2, 10).padEnd(8, "0");
+  return `c-${Date.now().toString(36)}-${random}`;
+}
+
+// Names are the user-facing handle for a connector (widgets, links, chat
+// refs), so they must be unique and cannot contain the ref separator ":".
+function isValidConnectorName(name) {
+  return typeof name === "string" && name.trim().length > 0 && !name.includes(":");
+}
+
+// Suggested name for a new connector of a kind: the kind's base name
+// ("opencode", "codex", …), then base-2, base-3, … skipping taken names.
+function generateConnectorName(kindId, takenNames) {
+  const taken = new Set(takenNames);
+  const base = CONNECTOR_KINDS[kindId]?.baseName || kindId;
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n += 1) {
+    const candidate = `${base}-${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
+
+// Normalizes a persisted connector entry: fills kind defaults, guards types.
+function normalizeConnector(entry) {
+  const kind = CONNECTOR_KINDS[entry?.kind] ? entry.kind : "opencode2";
+  const config = {
+    ...CONNECTOR_KINDS[kind].createConfig(),
+    ...(entry?.config && typeof entry.config === "object" ? entry.config : {}),
+  };
+  config.directories = Array.isArray(config.directories)
+    ? config.directories.map((directory) => String(directory || "").trim()).filter(Boolean)
+    : [];
+  const rawName = typeof entry?.name === "string" ? entry.name.trim() : "";
+  return {
+    id: typeof entry?.id === "string" && entry.id ? entry.id : newConnectorId(),
+    kind,
+    name: rawName || CONNECTOR_KINDS[kind].baseName,
+    enabled: entry?.enabled !== false,
+    config,
+  };
+}
+
+function dedupeConnectorNames(connectors) {
+  const seen = new Set();
+  for (const connector of connectors) {
+    if (!seen.has(connector.name)) {
+      seen.add(connector.name);
+      continue;
+    }
+    for (let n = 2; ; n += 1) {
+      const candidate = `${connector.name}-${n}`;
+      if (!seen.has(candidate)) {
+        connector.name = candidate;
+        seen.add(candidate);
+        break;
+      }
+    }
+  }
+}
+
+// Settings schema v2 (named connectors) with migration from the v0.7 flat
+// shape. `migratedFromLegacy` triggers one re-save that drops legacy keys.
+function migrateSettings(saved, vaultRoot) {
+  const pageSize =
+    Number.isFinite(saved.pageSize) && saved.pageSize > 0 ? saved.pageSize : DEFAULT_PAGE_SIZE;
+  const refreshSeconds = Number.isFinite(saved.refreshSeconds)
+    ? saved.refreshSeconds
+    : DEFAULT_REFRESH_SECONDS;
+  if (Array.isArray(saved.connectors) && saved.connectors.length) {
+    const connectors = saved.connectors.map(normalizeConnector);
+    dedupeConnectorNames(connectors);
+    return {
+      schemaVersion: 2,
+      defaultConnectorId: connectors.some((c) => c.id === saved.defaultConnectorId)
+        ? saved.defaultConnectorId
+        : connectors[0].id,
+      pageSize,
+      refreshSeconds,
+      connectors,
+    };
+  }
+  const connector = normalizeConnector({
+    id: newConnectorId(),
+    kind: "opencode2",
+    name: "opencode",
+    enabled: true,
+    config: {
+      apiBaseUrl: typeof saved.apiBaseUrl === "string" ? saved.apiBaseUrl : "",
+      apiPassword: typeof saved.apiPassword === "string" ? saved.apiPassword : "",
+      useDatabase: true,
+      databasePath: saved.databasePath || defaultDatabasePath(),
+      sqlitePath: saved.sqlitePath || defaultSqlitePath(),
+      directories:
+        Array.isArray(saved.directories) && saved.directories.length
+          ? saved.directories
+          : [vaultRoot].filter(Boolean),
+      customSql: typeof saved.customSql === "string" ? saved.customSql : "",
+    },
+  });
+  return {
+    schemaVersion: 2,
+    defaultConnectorId: connector.id,
+    pageSize,
+    refreshSeconds,
+    connectors: [connector],
+    migratedFromLegacy: true,
+  };
+}
+
 function defaultDatabasePath() {
   return path.join(os.homedir(), ".local", "share", "opencode", "opencode.db");
 }
@@ -341,8 +475,11 @@ class NodeSSE {
 // ---------------------------------------------------------------------------
 
 class OpenCodeClient {
-  constructor(plugin) {
-    this.plugin = plugin;
+  // `connector` is the shared mutable connector entry ({ id, kind, name,
+  // enabled, config }) — URL/password config edits apply without recreating
+  // the client.
+  constructor(connector) {
+    this.connector = connector;
     this.endpoint = null;
     this.endpointAt = 0;
     this.healthInfo = null;
@@ -370,7 +507,7 @@ class OpenCodeClient {
     if (!force && this.endpoint && Date.now() - this.endpointAt < ENDPOINT_CACHE_MS) {
       return this.endpoint;
     }
-    const settings = this.plugin.settings;
+    const settings = this.connector.config;
     const overrideUrl = String(settings.apiBaseUrl || "").trim().replace(/\/+$/, "");
     const overridePassword = String(settings.apiPassword || "").trim();
     const candidates = [];
@@ -502,8 +639,11 @@ class OpenCodeClient {
 // ---------------------------------------------------------------------------
 
 class ServerEventStream {
-  constructor(plugin) {
+  // One stream per OpenCode v2 driver: `driver` supplies the client
+  // (endpoint/auth) and identifies the connector when events fan out.
+  constructor(plugin, driver) {
     this.plugin = plugin;
+    this.driver = driver;
     this.source = null;
     this.connected = false;
     this.started = false;
@@ -585,7 +725,7 @@ class ServerEventStream {
     if (!this.started || this.source || this.connecting) return;
     let endpoint;
     try {
-      endpoint = await (this.connecting = this.plugin.client.resolve(this.attempt > 0));
+      endpoint = await (this.connecting = this.driver.client.resolve(this.attempt > 0));
     } catch {
       endpoint = null;
     } finally {
@@ -617,7 +757,7 @@ class ServerEventStream {
       } catch {
         return;
       }
-      if (event && event.type) this.plugin.handleServerEvent(event);
+      if (event && event.type) this.plugin.handleServerEvent(event, this.driver);
     };
     source.onerror = () => {
       // NodeSSE closes itself before reporting; re-discover and retry with
@@ -625,7 +765,7 @@ class ServerEventStream {
       if (source !== this.source) return;
       this.closeSource();
       this.setConnected(false);
-      this.plugin.client.invalidate();
+      this.driver.client.invalidate();
       this.reconnectSoon(Math.min(30000, 1000 * 2 ** Math.min(5, ++this.attempt)));
     };
   }
@@ -640,9 +780,387 @@ class ServerEventStream {
     if (value) {
       this.everConnected = true;
       if (typeof this.plugin.onStreamReconnected === "function") {
-        this.plugin.onStreamReconnected();
+        this.plugin.onStreamReconnected(this.driver);
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Connector drivers. A driver owns one connector instance: transport, live
+// event stream, and data access. Drivers normalize data into the shared
+// session/message model; every method may throw, and callers scope failures
+// to the connector that produced them.
+// ---------------------------------------------------------------------------
+
+class ConnectorDriver {
+  constructor(plugin, connector) {
+    this.plugin = plugin;
+    // Shared mutable settings object ({ id, kind, name, enabled, config });
+    // edits in the settings tab apply without recreating the driver.
+    this.connector = connector;
+  }
+
+  get config() {
+    return this.connector.config || {};
+  }
+
+  capabilities() {
+    throw new Error(`${this.constructor.name} must implement capabilities()`);
+  }
+
+  async health() {
+    return { ok: false, detail: "unknown connector kind" };
+  }
+
+  // Live-connection indicator for status lines and dashboards.
+  streamConnected() {
+    return false;
+  }
+
+  getLiveState() {
+    return null;
+  }
+
+  dispose() {}
+}
+
+class OpenCode2Driver extends ConnectorDriver {
+  constructor(plugin, connector) {
+    super(plugin, connector);
+    this.client = new OpenCodeClient(connector);
+    // sessionID -> { status, at } live states from this server's stream.
+    this.liveStates = new Map();
+    this.stream = new ServerEventStream(plugin, this);
+  }
+
+  start() {
+    this.stream.start();
+  }
+
+  dispose() {
+    this.stream.stop();
+    this.liveStates.clear();
+  }
+
+  restartConnection() {
+    this.client.invalidate();
+    this.stream.reconnectSoon(1);
+  }
+
+  streamConnected() {
+    return this.stream.connected;
+  }
+
+  getLiveState(sessionId) {
+    if (!this.stream.connected) return null;
+    return this.liveStates.get(sessionId) || { status: "idle", at: 0 };
+  }
+
+  capabilities() {
+    return {
+      listing: "db", // API-based listing arrives with remote connectors
+      live: "sse",
+      messages: true,
+      pagination: true,
+      chat: true,
+      models: true,
+      permissions: true,
+      drafts: true,
+      tokens: true,
+      cost: true,
+      titles: "stored",
+    };
+  }
+
+  async health() {
+    const health = await this.client.health();
+    return { ok: true, detail: `OpenCode v${health.version} (pid ${health.pid})` };
+  }
+
+  // ----- live event handling (v2) --------------------------------------------
+
+  onServerDisposed() {
+    this.client.invalidate();
+    this.liveStates.clear();
+    this.stream.reconnectSoon(1000);
+  }
+
+  applyLiveEvent(type, sessionId) {
+    if (!sessionId) return;
+    switch (type) {
+      case "session.execution.started":
+      case "session.step.started":
+        this.setLiveState(sessionId, "running");
+        break;
+      case "session.execution.succeeded":
+        this.setLiveState(sessionId, "idle");
+        break;
+      case "session.execution.interrupted":
+        this.setLiveState(sessionId, "interrupted");
+        break;
+      case "session.execution.failed":
+        this.setLiveState(sessionId, "error");
+        break;
+      case "permission.asked":
+        this.setLiveState(sessionId, "waiting");
+        break;
+      case "permission.replied":
+        // The agent loop resumes after a reply (approve continues the tool,
+        // reject fails it) — running until the execution result lands.
+        this.setLiveState(sessionId, "running");
+        break;
+      default:
+        break;
+    }
+  }
+
+  setLiveState(sessionId, status) {
+    if (!sessionId) return;
+    this.liveStates.set(sessionId, { status, at: Date.now() });
+  }
+
+  async syncActiveSessions() {
+    try {
+      const response = await this.client.activeSessions();
+      const active = new Set(Object.keys(response?.data || {}));
+      for (const [sessionId, state] of this.liveStates) {
+        if (state.status === "running" && !active.has(sessionId)) {
+          this.liveStates.set(sessionId, { status: "idle", at: Date.now() });
+        }
+      }
+      for (const sessionId of active) {
+        this.liveStates.set(sessionId, { status: "running", at: Date.now() });
+      }
+      this.plugin.emitChange();
+    } catch {
+      // discovery failures surface elsewhere
+    }
+  }
+
+  // ----- listing (SQLite session_v2; works without the server) ---------------
+
+  async listSessions(options = {}) {
+    const settings = this.config;
+    if (!settings.useDatabase) {
+      // Guard for the API-only mode landing with remote connectors.
+      throw new Error("This connector is configured without the database; enable it in settings.");
+    }
+    if (!fs.existsSync(settings.databasePath)) {
+      throw new Error(`Database not found: ${settings.databasePath}`);
+    }
+
+    const table = "session_v2";
+    const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector);
+    if (!directories.length) return [];
+    const directoryList = directories.map(quoteSql).join(", ");
+    const tableExists = await runSqlite(
+      settings.sqlitePath,
+      settings.databasePath,
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${quoteSql(table)}`,
+    );
+    if (!tableExists.some((row) => row.name === table)) {
+      throw new Error(`The v2 table (${table}) was not found in ${settings.databasePath}.`);
+    }
+
+    const customSql = validateSqlWhereFragment(
+      options.customSql !== undefined ? options.customSql : settings.customSql,
+    );
+    const fields = [
+      "id",
+      "directory",
+      "title",
+      "model",
+      "agent",
+      "time_created",
+      "time_updated",
+      "cost",
+      "tokens_input",
+      "tokens_output",
+      "tokens_reasoning",
+      "time_archived",
+      "time_suspended",
+      "version",
+    ].map((field) => `${table}.${field}`).join(", ");
+
+    // SQLite fallback state detection (used when the event stream is down):
+    // a running session's latest assistant message has no time.completed.
+    const stateFields =
+      ", m.time_updated AS last_assistant_time, json_extract(m.data, '$.time.completed') AS last_assistant_completed"
+      + ", lm.type AS last_message_type";
+    const stateJoin =
+      " LEFT JOIN session_message m ON m.session_id = session_v2.id AND m.type = 'assistant'"
+      + " AND m.seq = (SELECT MAX(seq) FROM session_message WHERE session_id = session_v2.id AND type = 'assistant')"
+      + " LEFT JOIN session_message lm ON lm.session_id = session_v2.id"
+      + " AND lm.seq = (SELECT MAX(seq) FROM session_message WHERE session_id = session_v2.id)";
+
+    const clauses = [`directory IN (${directoryList})`];
+    if (customSql) clauses.push(`(${customSql})`);
+    const rows = (await runSqlite(
+      settings.sqlitePath,
+      settings.databasePath,
+      `SELECT ${fields}${stateFields} FROM ${table}${stateJoin} WHERE ${clauses.join(" AND ")} ORDER BY ${table}.time_updated DESC`,
+    )).map((row) =>
+      this.plugin.decorateRow(
+        {
+          ...row,
+          connectorId: this.connector.id,
+          connectorName: this.connector.name,
+          source: "opencode2",
+        },
+        basedir,
+      ),
+    );
+    return rows.sort(
+      (a, b) => Number(b.time_updated || 0) - Number(a.time_updated || 0),
+    );
+  }
+
+  async loadSessionFromDb(sessionId) {
+    const settings = this.config;
+    if (!fs.existsSync(settings.databasePath)) {
+      throw new Error(`Database not found: ${settings.databasePath}`);
+    }
+    const rows = await runSqlite(
+      settings.sqlitePath,
+      settings.databasePath,
+      `SELECT * FROM session_v2 WHERE id = ${quoteSql(sessionId)} LIMIT 1`,
+    );
+    return rows[0] || null;
+  }
+
+  // Rows for explicitly pinned session ids (widget mode); preserves the
+  // given order and reports ids that no longer exist.
+  async loadSessionRowsByIds(ids) {
+    const rows = [];
+    const missing = [];
+    for (const id of ids) {
+      try {
+        const row = await this.loadSessionFromDb(id);
+        if (row) {
+          rows.push(
+            this.plugin.decorateRow(
+              {
+                ...row,
+                connectorId: this.connector.id,
+                connectorName: this.connector.name,
+                source: "opencode2",
+              },
+              "",
+            ),
+          );
+        } else {
+          missing.push(id);
+        }
+      } catch {
+        missing.push(id);
+      }
+    }
+    return { rows, missing };
+  }
+
+  async loadMessagesFromDb(sessionId) {
+    const settings = this.config;
+    if (!fs.existsSync(settings.databasePath)) {
+      throw new Error(`Database not found: ${settings.databasePath}`);
+    }
+    const rows = await runSqlite(
+      settings.sqlitePath,
+      settings.databasePath,
+      `SELECT id, type, seq, time_created, data FROM session_message WHERE session_id = ${quoteSql(sessionId)} ORDER BY seq ASC`,
+    );
+    return rows.map((row) => {
+      let parsed = {};
+      try {
+        parsed = JSON.parse(row.data);
+      } catch {
+        // leave parsed empty
+      }
+      return {
+        ...parsed,
+        id: row.id,
+        type: row.type,
+        time: parsed.time || { created: row.time_created },
+      };
+    });
+  }
+}
+
+function createDriverFor(plugin, connector) {
+  switch (connector.kind) {
+    case "opencode2":
+    default:
+      return new OpenCode2Driver(plugin, connector);
+  }
+}
+
+// Capabilities for API surfacing; a broken descriptor must not take the
+// whole config() call down with it.
+function safeCapabilities(driver) {
+  try {
+    return driver.capabilities();
+  } catch {
+    return null;
+  }
+}
+
+// Owns the drivers, resolves connectors by id/name, and picks the default
+// one. Failures stay scoped to a connector: the registry never propagates
+// one driver's errors into another's calls.
+class ConnectorRegistry {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.entries = new Map(); // connector id -> { connector, driver }
+  }
+
+  init() {
+    for (const connector of this.plugin.settings.connectors || []) {
+      this.create(connector);
+    }
+  }
+
+  create(connector) {
+    if (this.entries.has(connector.id)) return this.entries.get(connector.id);
+    const entry = { connector, driver: createDriverFor(this.plugin, connector) };
+    this.entries.set(connector.id, entry);
+    entry.driver.start();
+    return entry;
+  }
+
+  remove(id) {
+    const entry = this.entries.get(id);
+    if (!entry) return;
+    this.entries.delete(id);
+    entry.driver.dispose();
+  }
+
+  dispose() {
+    for (const id of [...this.entries.keys()]) this.remove(id);
+  }
+
+  all() {
+    return [...this.entries.values()];
+  }
+
+  enabled() {
+    return this.all().filter(({ connector }) => connector.enabled);
+  }
+
+  get(id) {
+    return (id && this.entries.get(id)) || null;
+  }
+
+  byName(name) {
+    if (!name) return null;
+    return this.all().find(({ connector }) => connector.name === name) || null;
+  }
+
+  // The configured default, else the first enabled connector; null when the
+  // plugin has no usable connector at all.
+  defaultConnector() {
+    const preferred = this.get(this.plugin.settings.defaultConnectorId);
+    if (preferred && preferred.connector.enabled) return preferred;
+    return this.enabled()[0] || null;
   }
 }
 
@@ -660,6 +1178,31 @@ class SessionsDashboard {
     this.filterNeedle = "";
     this.visible = DEFAULT_PAGE_SIZE;
     this.disposed = false;
+    // Connectors are referenced by name in block configs; omitting one uses
+    // the default connector. An unknown name is a visible error, not a
+    // silent fallback.
+    const connectorName =
+      typeof options.connector === "string" && options.connector.trim()
+        ? options.connector.trim()
+        : null;
+    this.connectorEntry = connectorName
+      ? plugin.registry.byName(connectorName)
+      : plugin.registry.defaultConnector();
+    this.connectorId = this.connectorEntry?.connector.id || null;
+    this.connectorError = connectorName && !this.connectorEntry
+      ? `Unknown connector: ${connectorName}`
+      : null;
+  }
+
+  driver() {
+    return this.connectorEntry?.driver || null;
+  }
+
+  connectorLabel() {
+    // Chip text: show the connector name when it is not the implicit default.
+    const name = this.connectorEntry?.connector.name;
+    if (!name) return "";
+    return name === this.plugin.registry.defaultConnector()?.connector.name ? "" : name;
   }
 
   basePageSize() {
@@ -749,19 +1292,36 @@ class SessionsDashboard {
 
   async load() {
     if (this.disposed) return;
+    if (this.connectorError) {
+      this.errorEl.setText(`OpenCode sessions error: ${this.connectorError}`);
+      this.sessions = [];
+      this.render();
+      return;
+    }
+    const driver = this.driver();
+    if (!driver || !this.connectorEntry.connector.enabled) {
+      this.errorEl.setText("No connector configured — add one in OpenCode Sessions settings.");
+      this.sessions = [];
+      this.render();
+      return;
+    }
     const pinnedIds = this.pinnedSessionIds();
     let pinnedRows = [];
     let missingRows = [];
     if (pinnedIds.length) {
-      const { rows, missing } = await this.plugin.loadSessionRowsByIds(pinnedIds);
-      pinnedRows = rows;
-      missingRows = missing.map((id) => this.plugin.missingSessionRow(id));
+      try {
+        const { rows, missing } = await driver.loadSessionRowsByIds(pinnedIds);
+        pinnedRows = rows;
+        missingRows = missing.map((id) => this.plugin.missingSessionRow(id, this.connectorEntry));
+      } catch {
+        missingRows = pinnedIds.map((id) => this.plugin.missingSessionRow(id, this.connectorEntry));
+      }
     }
     try {
       if (this.sessionsOnlyMode()) {
         this.sessions = [...pinnedRows, ...missingRows];
       } else {
-        const rows = await this.plugin.loadSessions({
+        const rows = await driver.listSessions({
           dirs: this.options.dirs,
           basedir: this.options.basedir,
         });
@@ -773,7 +1333,9 @@ class SessionsDashboard {
       this.errorEl.setText("");
     } catch (error) {
       if (this.disposed) return;
-      this.errorEl.setText(`OpenCode sessions unavailable: ${error.message}`);
+      this.errorEl.setText(
+        `OpenCode sessions unavailable: ${error.message}`,
+      );
       this.sessions = [...pinnedRows, ...missingRows];
     }
     this.render();
@@ -800,9 +1362,10 @@ class SessionsDashboard {
       ? filtered
       : filtered.slice(0, Math.max(this.visible, this.pinnedSessionIds().length));
     if (this.statusEl) {
-      const live = this.plugin.serverEvents?.connected ? " · live" : " · offline (db)";
+      const live = this.driver()?.streamConnected() ? " · live" : " · offline (db)";
+      const via = this.connectorLabel() ? ` · via ${this.connectorLabel()}` : "";
       this.statusEl.setText(
-        `${filtered.length} of ${this.sessions.length} session${filtered.length === 1 ? "" : "s"}${live}`,
+        `${filtered.length} of ${this.sessions.length} session${filtered.length === 1 ? "" : "s"}${live}${via}`,
       );
     }
     this.listEl.empty();
@@ -828,7 +1391,9 @@ class SessionsDashboard {
       const card = this.listEl.createDiv({
         cls: `opencode-sessions-card opencode-sessions-card-${session.state || "none"}${session.missing ? " opencode-sessions-card-missing" : ""}`,
       });
-      card.addEventListener("click", () => this.plugin.openSession(session.id));
+      card.addEventListener("click", () =>
+        this.plugin.openSession({ connectorId: this.connectorId, sessionId: session.id }),
+      );
       const head = card.createDiv({ cls: "opencode-sessions-card-head" });
       const title = head.createSpan({
         cls: "opencode-sessions-card-title",
@@ -865,7 +1430,9 @@ class SessionsDashboard {
     const body = table.createEl("tbody");
     for (const session of sessions) {
       const row = body.createEl("tr");
-      row.addEventListener("click", () => this.plugin.openSession(session.id));
+      row.addEventListener("click", () =>
+        this.plugin.openSession({ connectorId: this.connectorId, sessionId: session.id }),
+      );
       const title = row.createEl("td", { cls: "opencode-sessions-title", text: session.titleLabel });
       title.title = "Open session";
       row.createEl("td", {
@@ -948,8 +1515,14 @@ class SessionChatView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
-    this.sessionId = plugin.pendingSessionId || null;
-    plugin.pendingSessionId = null;
+    this.sessionId = plugin.pendingSessionRef?.sessionId || null;
+    this.connectorId = plugin.pendingSessionRef?.connectorId || null;
+    plugin.pendingSessionRef = null;
+    // Connector name persisted alongside the id for resilience when the
+    // connector was deleted between reloads (fall back by name, then default).
+    this.connectorName = null;
+    this.connector = null;
+    this.driver = null;
     // Draft mode: a not-yet-created session in this directory; the server
     // session is created lazily when the first message is sent.
     this.draftDirectory = plugin.pendingDraftDirectory || null;
@@ -984,15 +1557,45 @@ class SessionChatView extends ItemView {
     return "message-square";
   }
 
+  // Resolves the owning connector: by id, then persisted name, then the
+  // default connector (covers legacy states and deleted connectors).
+  resolveConnector() {
+    const registry = this.plugin.registry;
+    if (!registry) {
+      this.connector = null;
+      this.driver = null;
+      return;
+    }
+    const entry =
+      (this.connectorId ? registry.get(this.connectorId) : null) ||
+      (this.connectorName ? registry.byName(this.connectorName) : null) ||
+      registry.defaultConnector();
+    this.connector = entry?.connector || null;
+    this.driver = entry?.driver || null;
+    if (this.connector && !this.connectorId) this.connectorId = this.connector.id;
+    if (this.connector) this.connectorName = this.connector.name;
+  }
+
   // Persist across Obsidian reloads: workspace.json otherwise restores
   // `"state": {}` and the tab keeps a stale title with no content.
   // Obsidian calls setState() before onOpen() on restore.
   getState() {
-    return { sessionId: this.sessionId, draftDirectory: this.draftDirectory };
+    return {
+      sessionId: this.sessionId,
+      draftDirectory: this.draftDirectory,
+      connectorId: this.connectorId || this.connector?.id || null,
+      connectorName: this.connectorName || this.connector?.name || null,
+    };
   }
 
   async setState(state) {
     if (state && typeof state === "object") {
+      if (typeof state.connectorId === "string" && state.connectorId && !this.connectorId) {
+        this.connectorId = state.connectorId;
+      }
+      if (typeof state.connectorName === "string" && state.connectorName && !this.connectorName) {
+        this.connectorName = state.connectorName;
+      }
       if (typeof state.sessionId === "string" && state.sessionId) {
         if (!this.sessionId) this.sessionId = state.sessionId;
         if (!this.draftDirectory && typeof state.draftDirectory === "string") {
@@ -1012,6 +1615,14 @@ class SessionChatView extends ItemView {
   async onOpen() {
     this.contentEl.empty();
     this.contentEl.addClass("opencode-session-view");
+    this.resolveConnector();
+    if (!this.driver) {
+      this.contentEl.createDiv({
+        cls: "opencode-session-empty",
+        text: "Connector unavailable — it may have been removed in OpenCode Sessions settings.",
+      });
+      return;
+    }
     if (this.sessionId) {
       this.buildSkeleton();
       this.bindSession(this.sessionId);
@@ -1032,11 +1643,15 @@ class SessionChatView extends ItemView {
   }
 
   // (Re)wires the per-session event listener; used on open and again when a
-  // draft is promoted to a real session on the server.
+  // draft is promoted to a real session on the server. Session listeners are
+  // keyed `${connectorId}:${sessionId}` so multiple connectors' event
+  // streams never collide.
   bindSession(sessionId) {
     if (this.unsubscribeEvents) this.unsubscribeEvents();
     this.sessionId = sessionId;
-    this.unsubscribeEvents = this.plugin.subscribeSession(sessionId, (event) =>
+    this.resolveConnector();
+    const key = this.connectorId ? `${this.connectorId}:${sessionId}` : sessionId;
+    this.unsubscribeEvents = this.plugin.subscribeSession(key, (event) =>
       this.onServerEvent(event),
     );
   }
@@ -1059,6 +1674,10 @@ class SessionChatView extends ItemView {
     setIcon(this.backButton, "arrow-left");
     this.backButton.addEventListener("click", () => this.plugin.activateView());
     this.titleEl = titleRow.createEl("span", { cls: "oc-title", text: this.sessionId });
+    // Connector chip: shown when this chat does not belong to the default
+    // connector (e.g. a remote OpenCode server).
+    this.connectorChipEl = titleRow.createSpan({ cls: "oc-connector-chip", text: "" });
+    this.connectorChipEl.style.display = "none";
     this.badgeEl = titleRow.createSpan({
       cls: "opencode-sessions-badge opencode-sessions-badge-none",
       text: "",
@@ -1141,7 +1760,7 @@ class SessionChatView extends ItemView {
   }
 
   updateComposer() {
-    const connected = this.plugin.serverEvents?.connected;
+    const connected = this.driver?.streamConnected() || false;
     this.sendButton.disabled = !!this.offline || !this.inputEl?.value?.trim();
     this.stopButton.disabled = !!this.offline || !this.busy;
     this.stopButton.style.display = "";
@@ -1177,7 +1796,7 @@ class SessionChatView extends ItemView {
       this.badgeEl.setText(this.isDraft() ? "New" : "");
       return;
     }
-    const live = this.plugin.getLiveState(this.sessionId);
+    const live = this.driver?.getLiveState(this.sessionId) || null;
     const state = this.pendingPermission
       ? "waiting"
       : this.busy
@@ -1190,6 +1809,12 @@ class SessionChatView extends ItemView {
   }
 
   renderHeader() {
+    const defaultName = this.plugin.registry?.defaultConnector()?.connector.name;
+    const chipName = this.connector && this.connector.name !== defaultName ? this.connector.name : "";
+    if (this.connectorChipEl) {
+      this.connectorChipEl.setText(chipName ? `via ${chipName}` : "");
+      this.connectorChipEl.style.display = chipName ? "" : "none";
+    }
     if (!this.session) {
       if (this.isDraft()) {
         this.titleEl.setText("New session");
@@ -1227,11 +1852,11 @@ class SessionChatView extends ItemView {
     const seq = ++this.loadSeq;
     try {
       const [sessionResponse, messagesResponse] = await Promise.all([
-        this.plugin.client.session(this.sessionId),
+        this.driver.client.session(this.sessionId),
         // Newest page first: order=desc guarantees the latest messages are
         // included even in long sessions (order=asc&limit returns the
         // OLDEST page — sessions over the limit lose their tail).
-        this.plugin.client.messages(this.sessionId, { limit: DEFAULT_MESSAGE_PAGE, order: "desc" }),
+        this.driver.client.messages(this.sessionId, { limit: DEFAULT_MESSAGE_PAGE, order: "desc" }),
       ]);
       if (this.unsubscribed || seq !== this.loadSeq) return;
       this.setOffline(false);
@@ -1242,7 +1867,7 @@ class SessionChatView extends ItemView {
         messagesResponse?.cursor?.next || null,
       );
       // If the session is already running (view opened mid-stream), adopt it.
-      const live = this.plugin.getLiveState(this.sessionId);
+      const live = this.driver.getLiveState(this.sessionId);
       this.setBusy(live?.status === "running" || live?.status === "waiting");
       this.renderHeader();
       this.renderBadge();
@@ -1283,8 +1908,8 @@ class SessionChatView extends ItemView {
     let defaultRef = null;
     try {
       const [listResponse, resolvedDefault] = await Promise.all([
-        this.plugin.client.models(directory),
-        this.plugin.resolveDefaultModel(directory),
+        this.driver.client.models(directory),
+        this.plugin.resolveDefaultModel(directory, this.driver),
       ]);
       models = Array.isArray(listResponse?.data) ? listResponse.data : [];
       defaultRef = resolvedDefault;
@@ -1384,7 +2009,7 @@ class SessionChatView extends ItemView {
       return;
     }
     try {
-      await this.plugin.client.setSessionModel(this.sessionId, ref);
+      await this.driver.client.setSessionModel(this.sessionId, ref);
       this.session = { ...this.session, model: ref };
       this.renderHeader();
       new Notice(`Model switched to ${ref.id}${ref.variant ? ` (${ref.variant})` : ""}`);
@@ -1398,7 +2023,7 @@ class SessionChatView extends ItemView {
   // stream reconnect, layout-ready). Full reload when idle; non-destructive
   // upsert when streaming so live deltas are not clobbered.
   async refresh(manual = false) {
-    if (!this.sessionId || this.refreshing || this.unsubscribed) return;
+    if (!this.sessionId || !this.driver || this.refreshing || this.unsubscribed) return;
     if (this.isDraft()) return;
     if (this.busy && !manual) {
       await this.reconcileNow();
@@ -1446,7 +2071,7 @@ class SessionChatView extends ItemView {
   // Offline fallback: session row + messages straight from SQLite.
   async loadFromDb() {
     try {
-      const row = await this.plugin.loadSessionFromDb(this.sessionId);
+      const row = await this.driver.loadSessionFromDb(this.sessionId);
       if (row) {
         this.session = {
           id: row.id,
@@ -1463,7 +2088,7 @@ class SessionChatView extends ItemView {
           location: { directory: row.directory },
         };
       }
-      const messages = await this.plugin.loadMessagesFromDb(this.sessionId);
+      const messages = await this.driver.loadMessagesFromDb(this.sessionId);
       if (this.unsubscribed) return;
       this.resetMessages();
       this.appendMessages(messages, null);
@@ -1787,9 +2412,9 @@ class SessionChatView extends ItemView {
   // Recovers a pending approval on view open / refresh (e.g. a session that
   // was already waiting, or a reply made while this tab was reconnecting).
   async refreshPendingPermission() {
-    if (!this.sessionId || this.offline) return;
+    if (!this.sessionId || !this.driver || this.offline) return;
     try {
-      const response = await this.plugin.client.sessionPermissions(this.sessionId);
+      const response = await this.driver.client.sessionPermissions(this.sessionId);
       if (this.unsubscribed) return;
       const pending = (response?.data || [])[0] || null;
       if (pending) {
@@ -1846,7 +2471,7 @@ class SessionChatView extends ItemView {
     if (!pending || this.replyingPermission) return;
     this.replyingPermission = true;
     try {
-      await this.plugin.client.replyPermission(this.sessionId, pending.id, reply);
+      await this.driver.client.replyPermission(this.sessionId, pending.id, reply);
       this.clearPendingPermission(pending.id);
       new Notice(`Permission ${reply === "reject" ? "rejected" : reply === "always" ? "saved as always-allow" : "approved"}`);
     } catch (error) {
@@ -2001,15 +2626,15 @@ class SessionChatView extends ItemView {
   // Non-destructive reconcile: upserts latest messages + session header
   // without resetting the DOM (safe mid-stream, after reconnect, on focus).
   async reconcileNow() {
-    if (this.unsubscribed || this.offline || !this.sessionId || this.isDraft()) return;
+    if (this.unsubscribed || this.offline || !this.sessionId || !this.driver || this.isDraft()) return;
     try {
       const limit = Math.max(DEFAULT_MESSAGE_PAGE, this.messages.size);
-      const response = await this.plugin.client.messages(this.sessionId, { limit, order: "desc" });
+      const response = await this.driver.client.messages(this.sessionId, { limit, order: "desc" });
       if (this.unsubscribed) return;
       for (const message of [...(response?.data || [])].reverse()) {
         this.upsertMessage(message);
       }
-      const sessionResponse = await this.plugin.client.session(this.sessionId).catch(() => null);
+      const sessionResponse = await this.driver.client.session(this.sessionId).catch(() => null);
       if (!this.unsubscribed && sessionResponse?.data) {
         this.session = sessionResponse.data;
         this.renderHeader();
@@ -2023,7 +2648,7 @@ class SessionChatView extends ItemView {
   }
 
   async loadOlder() {
-    if (this.loadingOlder || !this.cursorOlder || this.offline) return;
+    if (this.loadingOlder || !this.cursorOlder || this.offline || !this.driver) return;
     this.loadingOlder = true;
     this.olderButton.setText("Loading…");
     const chat = this.chatEl;
@@ -2032,7 +2657,7 @@ class SessionChatView extends ItemView {
     try {
       // Cursor-only request (cursors must not combine with order); pages
       // continue toward older messages in newest→oldest order.
-      const response = await this.plugin.client.messages(this.sessionId, {
+      const response = await this.driver.client.messages(this.sessionId, {
         limit: DEFAULT_MESSAGE_PAGE,
         cursor: this.cursorOlder,
       });
@@ -2070,7 +2695,7 @@ class SessionChatView extends ItemView {
   }
 
   async send() {
-    if (this.offline) return;
+    if (this.offline || !this.driver) return;
     const text = this.inputEl.value.trim();
     if (!text) return;
     if (this.isDraft()) {
@@ -2081,7 +2706,7 @@ class SessionChatView extends ItemView {
     this.autoGrow();
     this.updateComposer();
     try {
-      const response = await this.plugin.client.prompt(this.sessionId, text);
+      const response = await this.driver.client.prompt(this.sessionId, text);
       const user = response?.data;
       this.upsertMessage({
         id: user?.id || `local-${Date.now()}`,
@@ -2102,7 +2727,7 @@ class SessionChatView extends ItemView {
   // empty sessions pile up when a draft is abandoned.
   async sendDraft(text) {
     try {
-      const created = await this.plugin.client.request("/api/session", {
+      const created = await this.driver.client.request("/api/session", {
         method: "POST",
         body: {
           location: { directory: this.draftDirectory },
@@ -2118,7 +2743,7 @@ class SessionChatView extends ItemView {
       this.renderBadge();
       this.inputEl.value = "";
       this.autoGrow();
-      const response = await this.plugin.client.prompt(session.id, text);
+      const response = await this.driver.client.prompt(session.id, text);
       const user = response?.data;
       this.upsertMessage({
         id: user?.id || `local-${Date.now()}`,
@@ -2134,9 +2759,9 @@ class SessionChatView extends ItemView {
   }
 
   async stop() {
-    if (this.offline || !this.sessionId) return;
+    if (this.offline || !this.sessionId || !this.driver) return;
     try {
-      const response = await this.plugin.client.interrupt(this.sessionId);
+      const response = await this.driver.client.interrupt(this.sessionId);
       if (response && response.interrupted) {
         new Notice("Session interrupted");
       }
@@ -2223,121 +2848,68 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    this.connectorTimers = new Map();
+  }
+
+  clearConnectorTimers() {
+    for (const timer of this.connectorTimers.values()) window.clearInterval(timer);
+    this.connectorTimers.clear();
+  }
+
+  hide() {
+    this.clearConnectorTimers();
+    if (super.hide) super.hide();
   }
 
   display() {
     const { containerEl } = this;
+    this.clearConnectorTimers();
     containerEl.empty();
     containerEl.createEl("h2", { text: "OpenCode Sessions" });
 
-    containerEl.createEl("h3", { text: "OpenCode server (v2 API)" });
-    const statusEl = containerEl.createDiv({ cls: "opencode-sessions-status", text: "Checking…" });
-    const refreshStatus = async () => {
-      try {
-        const health = await this.plugin.client.health();
-        const endpoint = this.plugin.client.endpoint;
-        statusEl.setText(
-          `Connected${endpoint ? ` to ${endpoint.baseUrl}` : ""} — OpenCode v${health.version} (pid ${health.pid}). Event stream: ${this.plugin.serverEvents.connected ? "live" : "connecting…"}`,
-        );
-      } catch {
-        statusEl.setText(
-          "Server unreachable — dashboards fall back to SQLite polling; chat and input are disabled until it returns.",
-        );
-      }
-    };
-    refreshStatus();
-    if (!this.statusTimer) {
-      this.statusTimer = window.setInterval(() => {
-        if (statusEl.isConnected) refreshStatus();
-      }, 15000);
+    this.renderGlobalSection(containerEl);
+    containerEl.createEl("h3", { text: "Connectors" });
+    for (const connector of this.plugin.settings.connectors) {
+      this.renderConnectorCard(containerEl, connector);
     }
+    this.renderAddConnector(containerEl);
+  }
 
+  renderGlobalSection(containerEl) {
+    containerEl.createEl("h3", { text: "General" });
+
+    const registry = this.plugin.registry;
+    const entries = registry.all();
+    const defaultEntry = registry.defaultConnector();
     new Setting(containerEl)
-      .setName("Server URL override")
-      .setDesc("Leave empty to auto-discover via ~/.local/state/opencode/service.json (recommended).")
-      .addText((text) =>
-        text
-          .setPlaceholder("http://127.0.0.1:49374")
-          .setValue(this.plugin.settings.apiBaseUrl)
-          .onChange(async (value) => {
-            this.plugin.settings.apiBaseUrl = value.trim();
-            await this.plugin.saveSettings();
-            this.plugin.client.invalidate();
-            this.plugin.restartServerConnection();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("Server password override")
-      .setDesc("Basic-auth password. Leave empty to use the discovered service credentials.")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.apiPassword)
-          .onChange(async (value) => {
-            this.plugin.settings.apiPassword = value.trim();
-            await this.plugin.saveSettings();
-            this.plugin.client.invalidate();
-            this.plugin.restartServerConnection();
-          }),
-      );
-
-    containerEl.createEl("h3", { text: "Session database (SQLite)" });
-
-    new Setting(containerEl)
-      .setName("OpenCode database")
-      .setDesc("Read-only SQLite database used by OpenCode v2 (session_v2).")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.databasePath)
-          .onChange(async (value) => {
-            this.plugin.settings.databasePath = value.trim();
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("sqlite3 executable")
-      .setDesc("Usually just sqlite3, or an absolute path to the executable.")
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.sqlitePath)
-          .onChange(async (value) => {
-            this.plugin.settings.sqlitePath = value.trim() || defaultSqlitePath();
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("Directories")
-      .setDesc("One OpenCode working directory per line. Add historical aliases if needed.")
-      .addTextArea((text) => {
-        text
-          .setValue(this.plugin.settings.directories.join("\n"))
-          .onChange(async (value) => {
-            this.plugin.settings.directories = value
-              .split(/\r?\n/)
-              .map((line) => line.trim())
-              .filter(Boolean);
-            await this.plugin.saveSettings();
-          });
-        text.inputEl.rows = 5;
-        text.inputEl.style.width = "100%";
+      .setName("Default connector")
+      .setDesc(
+        "Used by dashboards and chats that do not name a connector. Falls back to the first enabled connector.",
+      )
+      .addDropdown((dropdown) => {
+        for (const { connector } of entries) {
+          dropdown.addOption(connector.id, `${connector.name} — ${CONNECTOR_KINDS[connector.kind]?.label || connector.kind}`);
+        }
+        if (!entries.length) dropdown.addOption("", "No connectors");
+        dropdown.setValue(defaultEntry?.connector.id || "");
+        dropdown.onChange(async (value) => {
+          this.plugin.settings.defaultConnectorId = value;
+          await this.plugin.saveSettings();
+        });
       });
 
     new Setting(containerEl)
-      .setName("Custom SQL")
-      .setDesc("Optional SQL WHERE fragment appended after directory IN (...). Example: title LIKE '%pipeline%'.")
-      .addTextArea((text) => {
+      .setName("Items per page")
+      .setDesc("Sessions shown per dashboard page by default. Code blocks can override this with pageSize.")
+      .addText((text) =>
         text
-          .setPlaceholder("title LIKE '%pipeline%'")
-          .setValue(this.plugin.settings.customSql)
+          .setValue(String(this.plugin.settings.pageSize))
           .onChange(async (value) => {
-            this.plugin.settings.customSql = value.trim();
+            const items = Math.max(1, Number.parseInt(value, 10) || DEFAULT_PAGE_SIZE);
+            this.plugin.settings.pageSize = items;
             await this.plugin.saveSettings();
-          });
-        text.inputEl.rows = 4;
-        text.inputEl.style.width = "100%";
-      });
+          }),
+      );
 
     new Setting(containerEl)
       .setName("Refresh interval")
@@ -2354,22 +2926,205 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Items per page")
-      .setDesc("Sessions shown per dashboard page by default. Code blocks can override this with pageSize.")
+      .setName("Open dashboard")
+      .setDesc("Open the sessions table in a new Obsidian tab.")
+      .addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.activateView()));
+  }
+
+  renderConnectorCard(containerEl, connector) {
+    const plugin = this.plugin;
+    const card = containerEl.createDiv({ cls: "opencode-connector-card" });
+    const head = card.createDiv({ cls: "opencode-connector-card-head" });
+    head.createSpan({
+      cls: "opencode-connector-kind",
+      text: `${CONNECTOR_KINDS[connector.kind]?.label || connector.kind}${connector.id === plugin.settings.defaultConnectorId ? " · default" : ""}`,
+    });
+
+    const nameInput = head.createEl("input", {
+      type: "text",
+      cls: "opencode-connector-name",
+      attr: { spellcheck: "false" },
+    });
+    nameInput.value = connector.name;
+    nameInput.addEventListener("change", async () => {
+      const value = nameInput.value.trim();
+      const taken = plugin.settings.connectors.some((c) => c.id !== connector.id && c.name === value);
+      if (!isValidConnectorName(value) || taken) {
+        new Notice(
+          taken ? `Name "${value}" is already used by another connector.` : "Connector names must be non-empty and cannot contain ':'.",
+        );
+        nameInput.value = connector.name;
+        return;
+      }
+      connector.name = value;
+      await plugin.saveSettings();
+    });
+
+    const entry = plugin.registry.get(connector.id);
+    const driver = entry?.driver || null;
+
+    const toggleWrap = head.createDiv({ cls: "opencode-connector-toggle" });
+    const toggleLabel = toggleWrap.createSpan({ text: "Enabled", cls: "opencode-connector-toggle-label" });
+    const toggle = toggleWrap.createEl("input", { type: "checkbox" });
+    toggle.checked = connector.enabled;
+    toggle.addEventListener("change", async () => {
+      connector.enabled = toggle.checked;
+      await plugin.saveSettings();
+    });
+    toggleLabel.addEventListener("click", () => {
+      toggle.checked = !toggle.checked;
+      toggle.dispatchEvent(new Event("change"));
+    });
+
+    head.createEl("button", { text: "Duplicate" }).addEventListener("click", async () => {
+      await plugin.duplicateConnector(connector.id);
+      this.display();
+    });
+    head.createEl("button", { text: "Delete" }).addEventListener("click", async () => {
+      await plugin.removeConnector(connector.id);
+      this.display();
+    });
+
+    const statusEl = card.createDiv({ cls: "opencode-sessions-status", text: "Checking…" });
+    const refreshStatus = async () => {
+      const currentDriver = plugin.registry.get(connector.id)?.driver;
+      if (!currentDriver) {
+        statusEl.setText("Connector not running.");
+        return;
+      }
+      try {
+        const { detail } = await currentDriver.health();
+        statusEl.setText(
+          `Connected — ${detail}. Event stream: ${currentDriver.streamConnected() ? "live" : "connecting…"}`,
+        );
+      } catch {
+        statusEl.setText(
+          "Server unreachable — dashboards fall back to SQLite polling; chat and input are disabled until it returns.",
+        );
+      }
+    };
+    refreshStatus();
+    this.connectorTimers.set(
+      connector.id,
+      window.setInterval(() => {
+        if (statusEl.isConnected) refreshStatus();
+      }, 15000),
+    );
+
+    const body = card.createDiv({ cls: "opencode-connector-card-body" });
+    if (connector.kind === "opencode2") {
+      this.renderOpenCode2Fields(body, connector, driver);
+    }
+  }
+
+  renderOpenCode2Fields(containerEl, connector, driver) {
+    const plugin = this.plugin;
+    const config = connector.config;
+
+    new Setting(containerEl)
+      .setName("Server URL override")
+      .setDesc("Leave empty to auto-discover via ~/.local/state/opencode/service.json (recommended).")
       .addText((text) =>
         text
-          .setValue(String(this.plugin.settings.pageSize))
+          .setPlaceholder("http://127.0.0.1:49374")
+          .setValue(config.apiBaseUrl)
           .onChange(async (value) => {
-            const items = Math.max(1, Number.parseInt(value, 10) || DEFAULT_PAGE_SIZE);
-            this.plugin.settings.pageSize = items;
-            await this.plugin.saveSettings();
+            config.apiBaseUrl = value.trim();
+            await plugin.saveSettings();
+            driver?.restartConnection();
           }),
       );
 
     new Setting(containerEl)
-      .setName("Open dashboard")
-      .setDesc("Open the sessions table in a new Obsidian tab.")
-      .addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.activateView()));
+      .setName("Server password override")
+      .setDesc("Basic-auth password. Leave empty to use the discovered service credentials.")
+      .addText((text) =>
+        text
+          .setValue(config.apiPassword)
+          .onChange(async (value) => {
+            config.apiPassword = value.trim();
+            await plugin.saveSettings();
+            driver?.restartConnection();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("OpenCode database")
+      .setDesc("Read-only SQLite database used by OpenCode v2 (session_v2).")
+      .addText((text) =>
+        text
+          .setValue(config.databasePath)
+          .onChange(async (value) => {
+            config.databasePath = value.trim();
+            await plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("sqlite3 executable")
+      .setDesc("Usually just sqlite3, or an absolute path to the executable.")
+      .addText((text) =>
+        text
+          .setValue(config.sqlitePath)
+          .onChange(async (value) => {
+            config.sqlitePath = value.trim() || defaultSqlitePath();
+            await plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Directories")
+      .setDesc("One OpenCode working directory per line. Add historical aliases if needed.")
+      .addTextArea((text) => {
+        text
+          .setValue(config.directories.join("\n"))
+          .onChange(async (value) => {
+            config.directories = value
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+            await plugin.saveSettings();
+          });
+        text.inputEl.rows = 5;
+        text.inputEl.style.width = "100%";
+      });
+
+    new Setting(containerEl)
+      .setName("Custom SQL")
+      .setDesc("Optional SQL WHERE fragment appended after directory IN (...). Example: title LIKE '%pipeline%'.")
+      .addTextArea((text) => {
+        text
+          .setPlaceholder("title LIKE '%pipeline%'")
+          .setValue(config.customSql)
+          .onChange(async (value) => {
+            config.customSql = value.trim();
+            await plugin.saveSettings();
+          });
+        text.inputEl.rows = 4;
+        text.inputEl.style.width = "100%";
+      });
+  }
+
+  renderAddConnector(containerEl) {
+    const kindSetting = new Setting(containerEl)
+      .setName("Add connector")
+      .setDesc("Each connector is a named backend — more kinds (Claude Code, Codex, Cursor, OpenCode v1) arrive in upcoming releases.");
+    let selectedKind = "opencode2";
+    kindSetting.addDropdown((dropdown) => {
+      for (const kind of Object.values(CONNECTOR_KINDS)) {
+        dropdown.addOption(kind.id, kind.label);
+      }
+      dropdown.setValue(selectedKind);
+      dropdown.onChange((value) => {
+        selectedKind = value;
+      });
+    });
+    kindSetting.addButton((button) =>
+      button.setButtonText("Add").onClick(async () => {
+        await this.plugin.addConnector(selectedKind);
+        this.display();
+      }),
+    );
   }
 }
 
@@ -2381,39 +3136,22 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
   async onload() {
     this.vaultRoot = this.app.vault.adapter?.basePath || "";
     const saved = (await this.loadData()) || {};
-    this.settings = {
-      databasePath: saved.databasePath || defaultDatabasePath(),
-      sqlitePath: saved.sqlitePath || defaultSqlitePath(),
-      // v2 only: the legacy v1 "session" table backend is gone.
-      databaseKind: "opencode2",
-      directories: Array.isArray(saved.directories) && saved.directories.length
-        ? saved.directories
-        : [this.vaultRoot].filter(Boolean),
-      customSql: typeof saved.customSql === "string" ? saved.customSql : "",
-      pageSize: Number.isFinite(saved.pageSize) && saved.pageSize > 0 ? saved.pageSize : DEFAULT_PAGE_SIZE,
-      refreshSeconds: Number.isFinite(saved.refreshSeconds)
-        ? saved.refreshSeconds
-        : DEFAULT_REFRESH_SECONDS,
-      apiBaseUrl: typeof saved.apiBaseUrl === "string" ? saved.apiBaseUrl : "",
-      apiPassword: typeof saved.apiPassword === "string" ? saved.apiPassword : "",
-    };
-    if (saved.databaseKind === "opencode") {
-      await this.saveData(this.settings); // migrate away from the v1 backend
+    this.settings = migrateSettings(saved, this.vaultRoot);
+    if (this.settings.migratedFromLegacy) {
+      delete this.settings.migratedFromLegacy;
+      await this.saveData(this.settings); // one-time re-save drops legacy flat keys
     }
 
     this.listeners = new Set();
-    // sessionID -> Set<listener(event)> for open chat views.
+    // `${connectorId}:${sessionID}` -> Set<listener(event)> for open chat views.
     this.sessionListeners = new Map();
-    // sessionID -> { status, at } live states from the event stream.
-    this.liveStates = new Map();
     this.listRefreshTimer = null;
-    this.pendingSessionId = null;
+    this.pendingSessionRef = null;
     this.pendingDraftDirectory = null;
     this.pendingPickerDirectories = null;
 
-    this.client = new OpenCodeClient(this);
-    this.serverEvents = new ServerEventStream(this);
-    this.serverEvents.start();
+    this.registry = new ConnectorRegistry(this);
+    this.registry.init();
 
     this.api = {
       apiVersion: 3,
@@ -2426,22 +3164,45 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       },
       subscribe: (listener) => this.subscribe(listener),
       config: () => ({
-        databasePath: this.settings.databasePath,
-        directories: [...this.settings.directories],
-        customSql: this.settings.customSql,
+        databasePath: this.defaultConnectorConfig()?.databasePath,
+        directories: [...(this.defaultConnectorConfig()?.directories || [])],
+        customSql: this.defaultConnectorConfig()?.customSql || "",
         refreshSeconds: this.settings.refreshSeconds,
         pageSize: this.settings.pageSize,
-        server: this.client.endpoint,
-        eventsConnected: this.serverEvents.connected,
+        server: this.client?.endpoint || null,
+        eventsConnected: this.serverEvents?.connected || false,
+        connectors: this.registry.all().map(({ connector, driver }) => ({
+          id: connector.id,
+          name: connector.name,
+          kind: connector.kind,
+          enabled: connector.enabled,
+          capabilities: safeCapabilities(driver),
+        })),
+        defaultConnector: this.registry.defaultConnector()?.connector.name || null,
       }),
-      open: (sessionId) => this.openSession(sessionId),
+      open: (ref) => this.openSession(ref),
       server: {
-        connected: () => this.serverEvents.connected,
-        health: () => this.client.health(),
-        session: (sessionId) => this.client.session(sessionId),
-        messages: (sessionId, options) => this.client.messages(sessionId, options),
-        prompt: (sessionId, text) => this.client.prompt(sessionId, text),
-        stop: (sessionId) => this.client.interrupt(sessionId),
+        connected: () => this.serverEvents?.connected || false,
+        health: () => {
+          if (!this.client) throw new Error("No OpenCode v2 connector configured");
+          return this.client.health();
+        },
+        session: (sessionId) => {
+          if (!this.client) throw new Error("No OpenCode v2 connector configured");
+          return this.client.session(sessionId);
+        },
+        messages: (sessionId, options) => {
+          if (!this.client) throw new Error("No OpenCode v2 connector configured");
+          return this.client.messages(sessionId, options);
+        },
+        prompt: (sessionId, text) => {
+          if (!this.client) throw new Error("No OpenCode v2 connector configured");
+          return this.client.prompt(sessionId, text);
+        },
+        stop: (sessionId) => {
+          if (!this.client) throw new Error("No OpenCode v2 connector configured");
+          return this.client.interrupt(sessionId);
+        },
       },
     };
     this.api.getConfig = this.api.config;
@@ -2451,7 +3212,8 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.registerView(VIEW_TYPE_SESSION, (leaf) => new SessionChatView(leaf, this));
     this.registerView(VIEW_TYPE_NEW_SESSION, (leaf) => new NewSessionView(leaf, this));
     // Note-embeddable dashboards: ```opencode-sessions blocks render the same
-    // dashboard as the view, configured by the block body.
+    // dashboard as the view, configured by the block body. A `connector:`
+    // option selects a named connector; without it the default is used.
     this.registerMarkdownCodeBlockProcessor(BLOCK_LANGUAGE, (source, el, ctx) => {
       let options;
       try {
@@ -2478,11 +3240,15 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       callback: () => this.promptForSessionId(),
     });
     // Links from notes: [label](opencode-session://open?sessionId=ses_…)
+    // A `connector` parameter names the connector for non-default backends:
+    // [label](opencode-session://open?connector=claude&sessionId=<uuid>)
     this.registerObsidianProtocolHandler("opencode-session", (params) => {
       const id = [params.sessionId, params.session, params.id].find(
-        (value) => typeof value === "string" && value.startsWith("ses_"),
+        (value) => typeof value === "string" && value.trim(),
       );
-      if (id) this.openSession(id);
+      if (!id) return;
+      const connectorName = typeof params.connector === "string" ? params.connector.trim() : "";
+      this.openSession(connectorName ? `${connectorName}:${id.trim()}` : id.trim());
     });
     this.addRibbonIcon("messages-square", "Open OpenCode sessions", () => this.activateView());
     this.addSettingTab(new OpenCodeSessionsSettingTab(this.app, this));
@@ -2511,10 +3277,26 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
   onunload() {
     if (this.refreshTimer) window.clearInterval(this.refreshTimer);
     if (this.listRefreshTimer) window.clearTimeout(this.listRefreshTimer);
-    this.serverEvents.stop();
+    this.registry?.dispose();
     this.listeners.clear();
     this.sessionListeners.clear();
     if (globalThis.opencodeSessions === this.api) delete globalThis.opencodeSessions;
+  }
+
+  // Compat accessors: the default connector's v2 client / event stream.
+  // Views must use their own connector's driver instead of these.
+  get client() {
+    const driver = this.registry?.defaultConnector()?.driver;
+    return driver instanceof OpenCode2Driver ? driver.client : null;
+  }
+
+  get serverEvents() {
+    const driver = this.registry?.defaultConnector()?.driver;
+    return driver instanceof OpenCode2Driver ? driver.stream : null;
+  }
+
+  defaultConnectorConfig() {
+    return this.registry?.defaultConnector()?.connector.config || null;
   }
 
   // Push-based change notification: consumers (e.g. Datacore JSX views)
@@ -2553,43 +3335,20 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
 
   // ----- v2 event stream handling -------------------------------------------
 
-  handleServerEvent(event) {
+  // Entry point for every driver's SSE events; `driver` identifies the
+  // connector so multiple OpenCode servers never collide.
+  handleServerEvent(event, driver) {
+    if (!driver) return;
     const type = String(event.type || "");
     const data = event.data || {};
     if (type === "server.instance.disposed") {
-      this.client.invalidate();
-      this.liveStates.clear();
-      this.serverEvents.reconnectSoon(1000);
+      driver.onServerDisposed();
       return;
     }
     const sessionId = data.sessionID;
-    switch (type) {
-      case "session.execution.started":
-      case "session.step.started":
-        this.setLiveState(sessionId, "running");
-        break;
-      case "session.execution.succeeded":
-        this.setLiveState(sessionId, "idle");
-        break;
-      case "session.execution.interrupted":
-        this.setLiveState(sessionId, "interrupted");
-        break;
-      case "session.execution.failed":
-        this.setLiveState(sessionId, "error");
-        break;
-      case "permission.asked":
-        if (sessionId) this.setLiveState(sessionId, "waiting");
-        break;
-      case "permission.replied":
-        // The agent loop resumes after a reply (approve continues the tool,
-        // reject fails it) — running until the execution result lands.
-        if (sessionId) this.setLiveState(sessionId, "running");
-        break;
-      default:
-        break;
-    }
+    driver.applyLiveEvent(type, sessionId);
     if (!sessionId) return;
-    const listeners = this.sessionListeners.get(sessionId);
+    const listeners = this.sessionListeners.get(`${driver.connector.id}:${sessionId}`);
     if (listeners) {
       for (const listener of [...listeners]) {
         try {
@@ -2602,38 +3361,10 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     if (LIST_REFRESH_EVENTS.has(type)) this.scheduleListRefresh();
   }
 
-  setLiveState(sessionId, status) {
-    if (!sessionId) return;
-    this.liveStates.set(sessionId, { status, at: Date.now() });
-  }
-
-  getLiveState(sessionId) {
-    if (!this.serverEvents.connected) return null;
-    return this.liveStates.get(sessionId) || { status: "idle", at: 0 };
-  }
-
-  async syncActiveSessions() {
-    try {
-      const response = await this.client.activeSessions();
-      const active = new Set(Object.keys(response?.data || {}));
-      for (const [sessionId, state] of this.liveStates) {
-        if (state.status === "running" && !active.has(sessionId)) {
-          this.liveStates.set(sessionId, { status: "idle", at: Date.now() });
-        }
-      }
-      for (const sessionId of active) {
-        this.liveStates.set(sessionId, { status: "running", at: Date.now() });
-      }
-      this.emitChange();
-    } catch {
-      // discovery failures surface elsewhere
-    }
-  }
-
   // (2) Stream lost then recovered: SSE deltas in the gap are unrecoverable,
   // so reconcile every open session against the server + refresh the lists.
-  async onStreamReconnected() {
-    await this.syncActiveSessions();
+  async onStreamReconnected(driver) {
+    await driver.syncActiveSessions();
     await this.refreshOpenSessions("reconnect");
   }
 
@@ -2698,11 +3429,17 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
 
   // Default model for a directory, matching OpenCode's own resolution:
   // last-used model (TUI state) → server default for that location.
-  async resolveDefaultModel(directory) {
+  async resolveDefaultModel(directory, driver = null) {
     const fromState = this.readModelSelectionState();
     if (fromState) return fromState;
+    const client =
+      (driver instanceof OpenCode2Driver ? driver.client : null) ||
+      (this.registry.defaultConnector()?.driver instanceof OpenCode2Driver
+        ? this.registry.defaultConnector().driver.client
+        : null);
+    if (!client) return null;
     try {
-      const response = await this.client.defaultModel(directory);
+      const response = await client.defaultModel(directory);
       const model = response?.data;
       if (model?.id && model?.providerID) {
         return { id: model.id, providerID: model.providerID, ...(model.variant ? { variant: model.variant } : {}) };
@@ -2714,13 +3451,59 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
   }
 
   restartServerConnection() {
-    this.client.invalidate();
-    this.serverEvents.reconnectSoon(1);
+    const driver = this.registry.defaultConnector()?.driver;
+    if (driver instanceof OpenCode2Driver) driver.restartConnection();
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
     this.emitChange();
+  }
+
+  // ----- connector management (settings tab) ---------------------------------
+
+  async addConnector(kindId) {
+    const kind = CONNECTOR_KINDS[kindId] || CONNECTOR_KINDS.opencode2;
+    const connector = normalizeConnector({
+      id: newConnectorId(),
+      kind: kind.id,
+      name: generateConnectorName(kind.id, this.settings.connectors.map((c) => c.name)),
+      enabled: true,
+      config: kind.createConfig(),
+    });
+    if (!connector.config.directories.length && this.vaultRoot) {
+      connector.config.directories = [this.vaultRoot];
+    }
+    this.settings.connectors.push(connector);
+    if (!this.settings.defaultConnectorId) this.settings.defaultConnectorId = connector.id;
+    this.registry.create(connector);
+    await this.saveSettings();
+    return connector;
+  }
+
+  async duplicateConnector(id) {
+    const source = this.registry.get(id)?.connector;
+    if (!source) return null;
+    const copy = normalizeConnector({
+      id: newConnectorId(),
+      kind: source.kind,
+      name: generateConnectorName(source.kind, this.settings.connectors.map((c) => c.name)),
+      enabled: source.enabled,
+      config: JSON.parse(JSON.stringify(source.config)),
+    });
+    this.settings.connectors.push(copy);
+    this.registry.create(copy);
+    await this.saveSettings();
+    return copy;
+  }
+
+  async removeConnector(id) {
+    this.settings.connectors = this.settings.connectors.filter((c) => c.id !== id);
+    if (this.settings.defaultConnectorId === id) {
+      this.settings.defaultConnectorId = this.settings.connectors[0]?.id || "";
+    }
+    this.registry.remove(id);
+    await this.saveSettings();
   }
 
   configureRefreshTimer() {
@@ -2749,11 +3532,29 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.app.workspace.revealLeaf(leaf);
   }
 
-  async openSession(sessionId) {
+  // Opens a session chat. Accepts { connectorId, sessionId }, the string
+  // "connectorName:sessionId", or a bare session id (default connector).
+  async openSession(ref) {
+    const { connectorId, sessionId, unknownConnector } = this.resolveSessionRef(ref);
+    if (unknownConnector) {
+      new Notice(`Unknown connector: ${unknownConnector}`);
+      return;
+    }
     if (!sessionId) return;
+    const entry = this.registry.get(connectorId) || this.registry.defaultConnector();
+    if (!entry) {
+      new Notice("OpenCode Sessions: no connector configured");
+      return;
+    }
+    const resolvedConnectorId = entry.connector.id;
     const existing = this.app.workspace
       .getLeavesOfType(VIEW_TYPE_SESSION)
-      .find((leaf) => leaf.view instanceof SessionChatView && leaf.view.sessionId === sessionId);
+      .find(
+        (leaf) =>
+          leaf.view instanceof SessionChatView &&
+          leaf.view.connectorId === resolvedConnectorId &&
+          leaf.view.sessionId === sessionId,
+      );
     if (existing) {
       this.app.workspace.revealLeaf(existing);
       // Previously this just revealed a potentially stale tab (missed SSE
@@ -2763,15 +3564,34 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       }
       return existing;
     }
-    this.pendingSessionId = sessionId;
+    this.pendingSessionRef = { connectorId: resolvedConnectorId, sessionId };
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({
       type: VIEW_TYPE_SESSION,
       active: true,
-      state: { sessionId },
+      state: { sessionId, connectorId: resolvedConnectorId },
     });
     this.app.workspace.revealLeaf(leaf);
     return leaf;
+  }
+
+  // Normalizes any accepted ref form. A bare string without ":" resolves to
+  // the default connector; "name:id" resolves the name (errors surface via
+  // the returned unknownConnector flag instead of a silent fallback).
+  resolveSessionRef(ref) {
+    if (ref && typeof ref === "object") {
+      return { connectorId: ref.connectorId || null, sessionId: ref.sessionId || null };
+    }
+    const value = String(ref || "");
+    const separator = value.indexOf(":");
+    if (separator === -1) {
+      return { connectorId: null, sessionId: value || null };
+    }
+    const name = value.slice(0, separator);
+    const sessionId = value.slice(separator + 1) || null;
+    const entry = this.registry.byName(name);
+    if (!entry) return { connectorId: null, sessionId, unknownConnector: name };
+    return { connectorId: entry.connector.id, sessionId };
   }
 
   // New-session flow: single configured directory goes straight to a draft
@@ -2790,9 +3610,15 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
   }
 
   async openSessionDraft(directory) {
+    const connectorId = this.registry.defaultConnector()?.connector.id || null;
     this.pendingDraftDirectory = directory;
+    this.pendingSessionRef = { connectorId, sessionId: null };
     const leaf = this.app.workspace.getLeaf("tab");
-    await leaf.setViewState({ type: VIEW_TYPE_SESSION, active: true, state: { draftDirectory: directory } });
+    await leaf.setViewState({
+      type: VIEW_TYPE_SESSION,
+      active: true,
+      state: { draftDirectory: directory, connectorId },
+    });
     this.app.workspace.revealLeaf(leaf);
     return leaf;
   }
@@ -2817,20 +3643,30 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
 
   promptForSessionId() {
     const modal = new Modal(this.app);
-    modal.titleEl.setText("Open OpenCode session");
+    modal.titleEl.setText("Open session");
     const input = modal.contentEl.createEl("input", {
       type: "text",
       cls: "oc-id-input",
-      attr: { placeholder: "ses_…", spellcheck: "false" },
+      attr: {
+        placeholder: "ses_… or connector:session-id (e.g. claude:<uuid>)",
+        spellcheck: "false",
+      },
     });
     const submit = async () => {
-      const id = input.value.trim();
+      const value = input.value.trim();
       modal.close();
-      if (id.startsWith("ses_")) {
-        await this.openSession(id);
-      } else {
-        new Notice("OpenCode session IDs start with ses_");
+      if (!value) return;
+      const { sessionId, unknownConnector } = this.resolveSessionRef(value);
+      if (unknownConnector) {
+        new Notice(`Unknown connector: ${unknownConnector}`);
+        return;
       }
+      if (!sessionId) return;
+      if (!value.includes(":") && !sessionId.startsWith("ses_")) {
+        new Notice("OpenCode v2 session IDs start with ses_ — prefix other backends' ids with a connector name");
+        return;
+      }
+      await this.openSession(value);
     };
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
@@ -2843,15 +3679,39 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     modal.open();
   }
 
-  // ----- SQLite listing (works without the server) ---------------------------
+  // ----- Listing / routing ----------------------------------------------------
+
+  // Driver for options that may carry a `connector` name; the default
+  // connector otherwise. Throws a descriptive error when nothing resolves.
+  async loadSessions(options = {}) {
+    const driver = this.driverForOptions(options);
+    if (!driver) {
+      throw new Error(
+        typeof options.connector === "string" && options.connector
+          ? `Unknown connector: ${options.connector}`
+          : "No connector configured",
+      );
+    }
+    return driver.listSessions(options);
+  }
+
+  driverForOptions(options = {}) {
+    const name = options.connector;
+    if (typeof name === "string" && name.trim()) {
+      return this.registry.byName(name.trim())?.driver || null;
+    }
+    return this.registry.defaultConnector()?.driver || null;
+  }
 
   // Normalizes directory options shared by listing and new-session picking.
-  resolveDirectories(options = {}) {
+  // Directory defaults come from the target connector's config.
+  resolveDirectories(options = {}, connector = null) {
+    const config = connector?.config || this.defaultConnectorConfig() || {};
     const requestedDirectories = options.dirs !== undefined
       ? options.dirs
       : options.directories !== undefined
         ? options.directories
-        : this.settings.directories;
+        : config.directories;
     // Optional basedir: relative dir entries resolve against it (absolute
     // entries are left untouched) and card labels display relative to it.
     const rawBasedir = String(options.basedir || "").trim();
@@ -2867,148 +3727,12 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     return { basedir, directories };
   }
 
-  async loadSessions(options = {}) {
-    if (!fs.existsSync(this.settings.databasePath)) {
-      throw new Error(`Database not found: ${this.settings.databasePath}`);
-    }
-
-    const table = "session_v2";
-    const { basedir, directories } = this.resolveDirectories(options);
-    if (!directories.length) return [];
-    const directoryList = directories.map(quoteSql).join(", ");
-    const tableExists = await runSqlite(
-      this.settings.sqlitePath,
-      this.settings.databasePath,
-      `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${quoteSql(table)}`,
-    );
-    if (!tableExists.some((row) => row.name === table)) {
-      throw new Error(`The v2 table (${table}) was not found in ${this.settings.databasePath}.`);
-    }
-
-    const customSql = validateSqlWhereFragment(
-      options.customSql !== undefined ? options.customSql : this.settings.customSql,
-    );
-    const fields = [
-      "id",
-      "directory",
-      "title",
-      "model",
-      "agent",
-      "time_created",
-      "time_updated",
-      "cost",
-      "tokens_input",
-      "tokens_output",
-      "tokens_reasoning",
-      "time_archived",
-      "time_suspended",
-      "version",
-    ].map((field) => `${table}.${field}`).join(", ");
-
-    // SQLite fallback state detection (used when the event stream is down):
-    // a running session's latest assistant message has no time.completed.
-    const stateFields =
-      ", m.time_updated AS last_assistant_time, json_extract(m.data, '$.time.completed') AS last_assistant_completed"
-      + ", lm.type AS last_message_type";
-    const stateJoin =
-      " LEFT JOIN session_message m ON m.session_id = session_v2.id AND m.type = 'assistant'"
-      + " AND m.seq = (SELECT MAX(seq) FROM session_message WHERE session_id = session_v2.id AND type = 'assistant')"
-      + " LEFT JOIN session_message lm ON lm.session_id = session_v2.id"
-      + " AND lm.seq = (SELECT MAX(seq) FROM session_message WHERE session_id = session_v2.id)";
-
-    const clauses = [`directory IN (${directoryList})`];
-    if (customSql) clauses.push(`(${customSql})`);
-    const rows = (await runSqlite(
-      this.settings.sqlitePath,
-      this.settings.databasePath,
-      `SELECT ${fields}${stateFields} FROM ${table}${stateJoin} WHERE ${clauses.join(" AND ")} ORDER BY ${table}.time_updated DESC`,
-    )).map((row) => this.decorateRow({ ...row, source: "opencode2" }, basedir));
-    return rows.sort(
-      (a, b) => Number(b.time_updated || 0) - Number(a.time_updated || 0),
-    );
-  }
-
-  async loadSessionFromDb(sessionId) {
-    if (!fs.existsSync(this.settings.databasePath)) {
-      throw new Error(`Database not found: ${this.settings.databasePath}`);
-    }
-    const rows = await runSqlite(
-      this.settings.sqlitePath,
-      this.settings.databasePath,
-      `SELECT * FROM session_v2 WHERE id = ${quoteSql(sessionId)} LIMIT 1`,
-    );
-    return rows[0] || null;
-  }
-
-  // Rows for explicitly pinned session ids (widget mode); preserves the
-  // given order and reports ids that no longer exist.
-  async loadSessionRowsByIds(ids) {
-    const rows = [];
-    const missing = [];
-    for (const id of ids) {
-      try {
-        const row = await this.loadSessionFromDb(id);
-        if (row) {
-          rows.push(this.decorateRow({ ...row, source: "opencode2" }, ""));
-        } else {
-          missing.push(id);
-        }
-      } catch {
-        missing.push(id);
-      }
-    }
-    return { rows, missing };
-  }
-
-  // Placeholder row for a pinned id that is not in the database (deleted or
-  // wrong id) — rendered as a dashed, muted card so typos are visible.
-  missingSessionRow(id) {
-    return {
-      id,
-      title: null,
-      titleLabel: id,
-      state: "none",
-      stateLabel: "",
-      modelLabel: "",
-      updatedLabel: "",
-      directoryLabel: "",
-      tokensLabel: "",
-      agent: "",
-      source: "opencode2",
-      missing: true,
-    };
-  }
-
-  async loadMessagesFromDb(sessionId) {
-    if (!fs.existsSync(this.settings.databasePath)) {
-      throw new Error(`Database not found: ${this.settings.databasePath}`);
-    }
-    const rows = await runSqlite(
-      this.settings.sqlitePath,
-      this.settings.databasePath,
-      `SELECT id, type, seq, time_created, data FROM session_message WHERE session_id = ${quoteSql(sessionId)} ORDER BY seq ASC`,
-    );
-    return rows.map((row) => {
-      let parsed = {};
-      try {
-        parsed = JSON.parse(row.data);
-      } catch {
-        // leave parsed empty
-      }
-      return {
-        ...parsed,
-        id: row.id,
-        type: row.type,
-        time: parsed.time || { created: row.time_created },
-      };
-    });
-  }
-
   // Rows are decorated once here so every consumer (plugin view, Datacore JSX)
   // gets ready-to-render fields instead of re-implementing formatting.
   // With basedir set, directory labels are shown relative to it.
+  // Drivers that compute their own state can preset `row.state`.
   decorateRow(row, basedir = "") {
-    const state = this.sessionState(row);
+    const state = row.state || this.sessionState(row);
     return {
       ...row,
       titleLabel: row.title || "Untitled session",
@@ -3021,11 +3745,34 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     };
   }
 
+  // Placeholder row for a pinned id that is not in the connector's data
+  // (deleted or wrong id) — rendered as a dashed, muted card so typos show.
+  missingSessionRow(id, entry = null) {
+    const connector = entry?.connector || this.registry.defaultConnector()?.connector;
+    return {
+      id,
+      title: null,
+      titleLabel: id,
+      state: "none",
+      stateLabel: "",
+      modelLabel: "",
+      updatedLabel: "",
+      directoryLabel: "",
+      tokensLabel: "",
+      agent: "",
+      connectorId: connector?.id || null,
+      connectorName: connector?.name || "",
+      source: connector?.kind || "opencode2",
+      missing: true,
+    };
+  }
+
   sessionState(row) {
-    // Live first: the v2 event stream knows the truth (running, idle,
-    // interrupted, error, waiting for permission).
-    if (this.serverEvents.connected) {
-      const live = this.liveStates.get(row.id);
+    // Live first: the connector's own event stream knows the truth
+    // (running, idle, interrupted, error, waiting for permission).
+    const driver = this.registry.get(row.connectorId)?.driver;
+    if (driver?.streamConnected()) {
+      const live = driver.getLiveState(row.id);
       const status = live ? live.status : "idle";
       if (status === "idle" && row.time_suspended) return "suspended";
       return status;
