@@ -87,10 +87,14 @@ function normalizeConnector(entry) {
     ? config.directories.map((directory) => String(directory || "").trim()).filter(Boolean)
     : [];
   const rawName = typeof entry?.name === "string" ? entry.name.trim() : "";
+  // Names containing ":" would break the "name:sessionId" ref syntax; a
+  // hand-edited data.json with such a name falls back to the kind's base
+  // name (dedupe uniquifies it below).
+  const name = rawName && !rawName.includes(":") ? rawName : CONNECTOR_KINDS[kind].baseName;
   return {
     id: typeof entry?.id === "string" && entry.id ? entry.id : newConnectorId(),
     kind,
-    name: rawName || CONNECTOR_KINDS[kind].baseName,
+    name,
     enabled: entry?.enabled !== false,
     config,
   };
@@ -122,14 +126,14 @@ function migrateSettings(saved, vaultRoot) {
   const refreshSeconds = Number.isFinite(saved.refreshSeconds)
     ? saved.refreshSeconds
     : DEFAULT_REFRESH_SECONDS;
-  if (Array.isArray(saved.connectors) && saved.connectors.length) {
+  if (Array.isArray(saved.connectors)) {
     const connectors = saved.connectors.map(normalizeConnector);
     dedupeConnectorNames(connectors);
     return {
       schemaVersion: 2,
       defaultConnectorId: connectors.some((c) => c.id === saved.defaultConnectorId)
         ? saved.defaultConnectorId
-        : connectors[0].id,
+        : connectors[0]?.id || "",
       pageSize,
       refreshSeconds,
       connectors,
@@ -823,6 +827,16 @@ class ConnectorDriver {
   }
 
   dispose() {}
+
+  // Enabled/disabled transitions from the settings tab.
+  setActive(active) {
+    if (active) this.start();
+    else this.stop();
+  }
+
+  start() {}
+
+  stop() {}
 }
 
 class OpenCode2Driver extends ConnectorDriver {
@@ -838,8 +852,12 @@ class OpenCode2Driver extends ConnectorDriver {
     this.stream.start();
   }
 
-  dispose() {
+  stop() {
     this.stream.stop();
+  }
+
+  dispose() {
+    this.stop();
     this.liveStates.clear();
   }
 
@@ -943,8 +961,8 @@ class OpenCode2Driver extends ConnectorDriver {
   async listSessions(options = {}) {
     const settings = this.config;
     if (!settings.useDatabase) {
-      // Guard for the API-only mode landing with remote connectors.
-      throw new Error("This connector is configured without the database; enable it in settings.");
+      // API-only listing lands with remote connectors (Phase 2).
+      throw new Error("Database listing is disabled for this connector (API-only mode arrives with remote connectors).");
     }
     if (!fs.existsSync(settings.databasePath)) {
       throw new Error(`Database not found: ${settings.databasePath}`);
@@ -1107,6 +1125,11 @@ function safeCapabilities(driver) {
 // Owns the drivers, resolves connectors by id/name, and picks the default
 // one. Failures stay scoped to a connector: the registry never propagates
 // one driver's errors into another's calls.
+//
+// Note: settings edits mutate the shared connector/config objects drivers
+// hold references to, so no rebuild/diff pass is needed — only add/delete
+// (and enable/disable) touch the registry. Per-connector status recording
+// (lastError) arrives with the settings polish phase.
 class ConnectorRegistry {
   constructor(plugin) {
     this.plugin = plugin;
@@ -1123,7 +1146,9 @@ class ConnectorRegistry {
     if (this.entries.has(connector.id)) return this.entries.get(connector.id);
     const entry = { connector, driver: createDriverFor(this.plugin, connector) };
     this.entries.set(connector.id, entry);
-    entry.driver.start();
+    // Disabled connectors stay registered (chats may still reference them)
+    // but do not keep a live event connection.
+    if (connector.enabled) entry.driver.start();
     return entry;
   }
 
@@ -1185,13 +1210,27 @@ class SessionsDashboard {
       typeof options.connector === "string" && options.connector.trim()
         ? options.connector.trim()
         : null;
-    this.connectorEntry = connectorName
-      ? plugin.registry.byName(connectorName)
-      : plugin.registry.defaultConnector();
+    // Explicitly named connectors pin this dashboard; without a name the
+    // dashboard follows the default connector as settings change.
+    this.requestedConnectorName = connectorName;
+    this.connectorEntry = null;
+    this.connectorId = null;
+    this.connectorError = null;
+  }
+
+  // (Re)resolves the connector binding; runs on every load so default
+  // switches, disables, and deletions take effect in mounted dashboards.
+  refreshConnectorBinding() {
+    if (this.requestedConnectorName) {
+      const entry = this.plugin.registry.byName(this.requestedConnectorName);
+      this.connectorEntry = entry;
+      this.connectorId = entry?.connector.id || null;
+      this.connectorError = entry ? null : `Unknown connector: ${this.requestedConnectorName}`;
+      return;
+    }
+    this.connectorEntry = this.plugin.registry.defaultConnector();
     this.connectorId = this.connectorEntry?.connector.id || null;
-    this.connectorError = connectorName && !this.connectorEntry
-      ? `Unknown connector: ${connectorName}`
-      : null;
+    this.connectorError = null;
   }
 
   driver() {
@@ -1292,6 +1331,7 @@ class SessionsDashboard {
 
   async load() {
     if (this.disposed) return;
+    this.refreshConnectorBinding();
     if (this.connectorError) {
       this.errorEl.setText(`OpenCode sessions error: ${this.connectorError}`);
       this.sessions = [];
@@ -1572,8 +1612,13 @@ class SessionChatView extends ItemView {
       registry.defaultConnector();
     this.connector = entry?.connector || null;
     this.driver = entry?.driver || null;
-    if (this.connector && !this.connectorId) this.connectorId = this.connector.id;
-    if (this.connector) this.connectorName = this.connector.name;
+    // Always sync to the resolved connector: a stale id (connector deleted
+    // between reloads) must not linger — it keys SSE subscriptions, view
+    // dedupe, and persisted state.
+    if (this.connector) {
+      this.connectorId = this.connector.id;
+      this.connectorName = this.connector.name;
+    }
   }
 
   // Persist across Obsidian reloads: workspace.json otherwise restores
@@ -1606,10 +1651,6 @@ class SessionChatView extends ItemView {
       }
     }
     return super.setState ? super.setState(state) : undefined;
-  }
-
-  setSession(sessionId) {
-    this.sessionId = sessionId;
   }
 
   async onOpen() {
@@ -2969,6 +3010,8 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
     toggle.checked = connector.enabled;
     toggle.addEventListener("change", async () => {
       connector.enabled = toggle.checked;
+      // Start/stop the live connection so disabled connectors go quiet.
+      plugin.registry.get(connector.id)?.driver.setActive(toggle.checked);
       await plugin.saveSettings();
     });
     toggleLabel.addEventListener("click", () => {
@@ -2994,8 +3037,9 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
       }
       try {
         const { detail } = await currentDriver.health();
+        const endpoint = currentDriver.client.endpoint;
         statusEl.setText(
-          `Connected — ${detail}. Event stream: ${currentDriver.streamConnected() ? "live" : "connecting…"}`,
+          `Connected${endpoint ? ` to ${endpoint.baseUrl}` : ""} — ${detail}. Event stream: ${currentDriver.streamConnected() ? "live" : "connecting…"}`,
         );
       } catch {
         statusEl.setText(
@@ -3450,10 +3494,6 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     return null;
   }
 
-  restartServerConnection() {
-    const driver = this.registry.defaultConnector()?.driver;
-    if (driver instanceof OpenCode2Driver) driver.restartConnection();
-  }
 
   async saveSettings() {
     await this.saveData(this.settings);
