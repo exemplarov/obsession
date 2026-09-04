@@ -51,6 +51,17 @@ const CONNECTOR_KINDS = {
       customSql: "",
     }),
   },
+  opencode1: {
+    id: "opencode1",
+    label: "OpenCode v1",
+    baseName: "opencode-v1",
+    createConfig: () => ({
+      databasePath: defaultDatabasePath(),
+      sqlitePath: defaultSqlitePath(),
+      directories: [],
+      customSql: "",
+    }),
+  },
   "claude-code": {
     id: "claude-code",
     label: "Claude Code",
@@ -2360,8 +2371,343 @@ class CursorDriver extends FileConnectorDriver {
   }
 }
 
+// --- OpenCode v1 (legacy SQLite) ------------------------------------------------
+//
+// v1 stored sessions in the same opencode.db: a `session` table (columns
+// nearly identical to session_v2) plus `message`/`part` tables where each
+// message's content parts live as separate rows (ULID ids, lexicographically
+// chronological). Read-only and historical — no server, no event stream.
+
+class OpenCode1Driver extends ConnectorDriver {
+  constructor(plugin, connector) {
+    super(plugin, connector);
+    // sessionId -> { messages, at }: historical data, but a still-running
+    // legacy opencode appends — entries expire so Refresh picks them up.
+    this.parseCache = new Map();
+  }
+
+  static CACHE_TTL_MS = 30 * 1000;
+
+  capabilities() {
+    return {
+      listing: "db",
+      live: "none",
+      messages: true,
+      pagination: true, // in-memory over the session's merged messages
+      chat: false,
+      models: false,
+      permissions: false,
+      drafts: false,
+      tokens: true,
+      cost: true,
+      titles: "stored",
+    };
+  }
+
+  async health() {
+    const settings = this.config;
+    if (!fs.existsSync(settings.databasePath)) {
+      return { ok: false, detail: `not found: ${settings.databasePath}` };
+    }
+    const tables = await runSqlite(
+      settings.sqlitePath,
+      settings.databasePath,
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session', 'message', 'part')",
+    );
+    const found = new Set(tables.map((row) => row.name));
+    if (!found.has("session")) {
+      return { ok: false, detail: `no v1 'session' table in ${settings.databasePath}` };
+    }
+    const count = await runSqlite(
+      settings.sqlitePath,
+      settings.databasePath,
+      "SELECT COUNT(*) AS n FROM session",
+    );
+    return {
+      ok: true,
+      detail: `OpenCode v1 database (${count[0]?.n || 0} sessions)${found.has("message") ? "" : " — messages missing"}`,
+    };
+  }
+
+  streamConnected() {
+    return false;
+  }
+
+  dispose() {
+    this.parseCache.clear();
+  }
+
+  async listSessions(options = {}) {
+    const settings = this.config;
+    if (!fs.existsSync(settings.databasePath)) {
+      throw new Error(`Database not found: ${settings.databasePath}`);
+    }
+    const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector);
+    if (!directories.length) return [];
+    const directoryList = directories.map(quoteSql).join(", ");
+    const customSql = validateSqlWhereFragment(
+      options.customSql !== undefined ? options.customSql : settings.customSql,
+    );
+    // SQLite fallback state detection, v1 flavor: the newest message being
+    // an unanswered user prompt (or an uncompleted assistant reply) reads
+    // as running within the freshness window.
+    const stateJoin =
+      " LEFT JOIN message lm ON lm.session_id = session.id"
+      + " AND lm.time_created = (SELECT MAX(time_created) FROM message WHERE session_id = session.id)";
+    const clauses = [`directory IN (${directoryList})`];
+    if (customSql) clauses.push(`(${customSql})`);
+    const rows = (
+      await runSqlite(
+        settings.sqlitePath,
+        settings.databasePath,
+        `SELECT session.id, session.directory, session.title, session.model, session.agent, session.time_created, session.time_updated, session.cost, session.tokens_input, session.tokens_output, session.tokens_reasoning, session.time_archived, session.version`
+        + `, json_extract(lm.data, '$.role') AS last_message_role`
+        + `, json_extract(lm.data, '$.time.completed') AS last_completed`
+        + `, lm.time_updated AS last_message_time`
+        + ` FROM session${stateJoin} WHERE ${clauses.join(" AND ")} ORDER BY session.time_updated DESC`,
+      )
+    ).map((row) =>
+      this.plugin.decorateRow(
+        {
+          ...row,
+          time_suspended: null,
+          state: this.heuristicState(row),
+          connectorId: this.connector.id,
+          connectorName: this.connector.name,
+          source: "opencode1",
+          readOnly: true,
+        },
+        basedir,
+      ),
+    );
+    return rows.sort((a, b) => Number(b.time_updated || 0) - Number(a.time_updated || 0));
+  }
+
+  heuristicState(row) {
+    const fresh = (value) => Number(value) && Date.now() - Number(value) < RUNNING_STALE_MS;
+    if (
+      (row.last_message_role === "assistant" && row.last_completed == null && fresh(row.last_message_time)) ||
+      (row.last_message_role === "user" && fresh(row.time_updated))
+    ) {
+      return "running";
+    }
+    return "idle";
+  }
+
+  // Pinned-id lookups (widget mode); v1 sessions are historical, so rows
+  // render idle like the v2 path's un-hinted lookups.
+  async loadSessionRowsByIds(ids) {
+    const settings = this.config;
+    const rows = [];
+    const missing = [];
+    for (const id of ids) {
+      try {
+        const found = await runSqlite(
+          settings.sqlitePath,
+          settings.databasePath,
+          `SELECT id, directory, title, model, agent, time_created, time_updated, cost, tokens_input, tokens_output, tokens_reasoning, time_archived, version FROM session WHERE id = ${quoteSql(id)} LIMIT 1`,
+        );
+        const row = found[0];
+        if (row) {
+          rows.push(
+            this.plugin.decorateRow(
+              {
+                ...row,
+                time_suspended: null,
+                state: "idle",
+                connectorId: this.connector.id,
+                connectorName: this.connector.name,
+                source: "opencode1",
+                readOnly: true,
+              },
+              "",
+            ),
+          );
+        } else {
+          missing.push(id);
+        }
+      } catch {
+        missing.push(id);
+      }
+    }
+    return { rows, missing };
+  }
+
+  async getSession(sessionId) {
+    const settings = this.config;
+    const rows = await runSqlite(
+      settings.sqlitePath,
+      settings.databasePath,
+      `SELECT id, directory, title, agent, model, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated FROM session WHERE id = ${quoteSql(sessionId)} LIMIT 1`,
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      id: row.id,
+      title: row.title || "Untitled session",
+      agent: row.agent || "",
+      model: row.model || null,
+      cost: row.cost || 0,
+      tokens: {
+        input: row.tokens_input || 0,
+        output: row.tokens_output || 0,
+        reasoning: row.tokens_reasoning || 0,
+        cache: { read: row.tokens_cache_read || 0, write: row.tokens_cache_write || 0 },
+      },
+      time: { created: row.time_created, updated: row.time_updated },
+      location: { directory: row.directory },
+    };
+  }
+
+  async listMessages(sessionId, options = {}) {
+    const messages = await this.loadMessages(sessionId);
+    return paginateMessages(messages, options);
+  }
+
+  async loadMessages(sessionId) {
+    const cached = this.parseCache.get(sessionId);
+    if (cached && Date.now() - cached.at < OpenCode1Driver.CACHE_TTL_MS) {
+      return cached.messages;
+    }
+    const settings = this.config;
+    // Field-level extraction instead of raw `data`: the sqlite3 CLI's JSON
+    // output mode is pathologically slow escaping large TEXT blobs (v1
+    // message envelopes embed summary diffs up to ~500KB), while scalar
+    // json_extract calls stay instant. Display-heavy fields are capped.
+    const messageRows = await runSqlite(
+      settings.sqlitePath,
+      settings.databasePath,
+      `SELECT id, time_created`
+      + `, json_extract(data, '$.role') AS role`
+      + `, json_extract(data, '$.agent') AS agent`
+      + `, json_extract(data, '$.time.created') AS data_created`
+      + `, json_extract(data, '$.time.completed') AS data_completed`
+      + `, json_extract(data, '$.model') AS model_json`
+      + `, json_extract(data, '$.providerID') AS provider_id`
+      + `, json_extract(data, '$.modelID') AS model_id`
+      + `, json_extract(data, '$.error.data.message') AS error_message`
+      + ` FROM message WHERE session_id = ${quoteSql(sessionId)} ORDER BY time_created, id`,
+    );
+    const partRows = await runSqlite(
+      settings.sqlitePath,
+      settings.databasePath,
+      `SELECT id, message_id`
+      + `, json_extract(data, '$.type') AS type`
+      + `, substr(json_extract(data, '$.text'), 1, 500000) AS text`
+      + `, json_extract(data, '$.tool') AS tool`
+      + `, json_extract(data, '$.state.status') AS status`
+      + `, substr(json_extract(data, '$.state.input'), 1, 100000) AS input`
+      + `, substr(json_extract(data, '$.state.output'), 1, 50000) AS output`
+      + `, json_extract(data, '$.state.error') AS state_error`
+      + `, json_extract(data, '$.files') AS files`
+      + ` FROM part WHERE session_id = ${quoteSql(sessionId)} ORDER BY id`,
+    );
+    const partsByMessage = new Map();
+    for (const row of partRows) {
+      if (!row.type) continue;
+      if (!partsByMessage.has(row.message_id)) partsByMessage.set(row.message_id, []);
+      partsByMessage.get(row.message_id).push(row);
+    }
+    const messages = [];
+    for (const row of messageRows) {
+      const content = [];
+      const userText = [];
+      const parts = partsByMessage.get(row.id) || [];
+      for (const part of parts) {
+        if (part.type === "text" && part.text) {
+          if (row.role === "user") userText.push(part.text);
+          else content.push({ type: "text", text: part.text });
+        } else if (part.type === "reasoning" && part.text) {
+          content.push({ type: "reasoning", text: part.text });
+        } else if (part.type === "tool") {
+          content.push({
+            type: "tool",
+            id: part.id,
+            name: part.tool || "tool",
+            state: {
+              status: part.status || "completed",
+              input: part.input ?? "",
+              content: part.output != null ? [{ type: "text", text: capToolOutput(String(part.output)) }] : [],
+              ...(part.state_error ? { error: { message: String(part.state_error) } } : {}),
+            },
+          });
+        } else if (part.type === "patch") {
+          let files = part.files;
+          if (typeof files === "string") {
+            try {
+              files = JSON.parse(files);
+            } catch {
+              files = [];
+            }
+          }
+          content.push({
+            type: "tool",
+            id: part.id,
+            name: "patch",
+            state: {
+              status: "completed",
+              input: JSON.stringify(Array.isArray(files) ? files : [], null, 2),
+              content: [],
+            },
+          });
+        }
+        // step-start / step-finish / file / compaction / subtask: skipped
+      }
+      let model = null;
+      if (typeof row.model_json === "string" && row.model_json.startsWith("{")) {
+        try {
+          model = JSON.parse(row.model_json);
+        } catch {
+          model = null;
+        }
+      } else if (row.provider_id || row.model_id) {
+        model = { providerID: row.provider_id, modelID: row.model_id, id: row.model_id };
+      }
+      if (row.role === "user") {
+        if (userText.length) {
+          messages.push({
+            id: row.id,
+            type: "user",
+            agent: row.agent || "",
+            time: { created: row.data_created ?? row.time_created },
+            text: userText.join("\n\n"),
+          });
+        }
+        continue;
+      }
+      if (row.role === "assistant") {
+        // Aborted turns leave part-less assistant messages; rendering them
+        // as empty "…" pending dots would read as streaming in a connector
+        // that can never stream.
+        if (!content.length) continue;
+        messages.push({
+          id: row.id,
+          type: "assistant",
+          agent: row.agent || "",
+          model,
+          error: row.error_message ? { message: row.error_message } : undefined,
+          time: {
+            created: row.data_created ?? row.time_created,
+            completed: row.data_completed ?? null,
+          },
+          content,
+        });
+      }
+    }
+    this.parseCache.set(sessionId, { messages, at: Date.now() });
+    // Bound the cache the same way file drivers do.
+    while (this.parseCache.size > FileConnectorDriver.PARSE_CACHE_LIMIT) {
+      const oldest = this.parseCache.keys().next().value;
+      this.parseCache.delete(oldest);
+    }
+    return messages;
+  }
+}
+
 function createDriverFor(plugin, connector) {
   switch (connector.kind) {
+    case "opencode1":
+      return new OpenCode1Driver(plugin, connector);
     case "claude-code":
       return new ClaudeCodeDriver(plugin, connector);
     case "codex":
@@ -2620,6 +2966,9 @@ class SessionsDashboard {
       this.render();
       return;
     }
+    const pinnedIds = this.pinnedSessionIds();
+    let pinnedRows = [];
+    let missingRows = [];
     try {
       if (pinnedIds.length) {
         const { rows, missing } = await driver.loadSessionRowsByIds(pinnedIds);
@@ -2672,11 +3021,14 @@ class SessionsDashboard {
     if (this.statusEl) {
       let live;
       try {
-        live = this.driver()?.capabilities().listing === "files"
+        const caps = this.driver()?.capabilities();
+        live = caps?.listing === "files"
           ? " · watching files"
-          : this.driver()?.streamConnected()
-            ? " · live"
-            : " · offline (db)";
+          : caps?.live === "none"
+            ? " · historical"
+            : this.driver()?.streamConnected()
+              ? " · live"
+              : " · offline (db)";
       } catch {
         live = "";
       }
@@ -3124,14 +3476,19 @@ class SessionChatView extends ItemView {
 
   setOffline(offline, reason = "") {
     this.offline = offline;
-    const detail = this.driver instanceof FileConnectorDriver
-      ? `Could not read this session's transcript${reason ? ` — ${reason}` : ""}. It may have been moved, deleted, or is too large; retrying.`
-      : `Server unreachable${reason ? ` — ${reason}` : ""}`;
+    let detail;
+    if (this.driver instanceof FileConnectorDriver) {
+      detail = `Could not read this session's transcript${reason ? ` — ${reason}` : ""}. It may have been moved, deleted, or is too large; retrying.`;
+    } else if (this.driver instanceof OpenCode1Driver) {
+      detail = `Could not read the v1 database${reason ? ` — ${reason}` : ""}. Check the connector's database path and sqlite3 setting.`;
+    } else {
+      detail = `Server unreachable${reason ? ` — ${reason}` : ""}`;
+    }
     this.offlineEl.setText(
       offline
         ? this.driver?.databaseUsable()
           ? `${detail}. Showing messages from the local database (read-only).`
-          : `${detail}. ${this.driver instanceof FileConnectorDriver ? "" : "History is unavailable until the server returns."}`
+          : `${detail}.`
         : "",
     );
     this.offlineEl.style.display = offline ? "" : "none";
@@ -4444,6 +4801,8 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
     const body = card.createDiv({ cls: "opencode-connector-card-body" });
     if (connector.kind === "opencode2") {
       this.renderOpenCode2Fields(body, connector, driver);
+    } else if (connector.kind === "opencode1") {
+      this.renderOpenCode1Fields(body, connector);
     } else if (connector.kind === "codex") {
       this.renderFileFields(body, connector, {
         rootKey: "sessionsRoot",
@@ -4462,6 +4821,63 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
         zstd: false,
       });
     }
+  }
+
+  renderOpenCode1Fields(containerEl, connector) {
+    const plugin = this.plugin;
+    const config = connector.config;
+    new Setting(containerEl)
+      .setName("OpenCode v1 database")
+      .setDesc("Read-only SQLite database with the legacy v1 tables (session/message/part). Often the same opencode.db as v2 — both connectors can point at it.")
+      .addText((text) =>
+        text
+          .setValue(config.databasePath)
+          .onChange(async (value) => {
+            config.databasePath = value.trim();
+            await plugin.saveSettings();
+          }),
+      );
+    new Setting(containerEl)
+      .setName("sqlite3 executable")
+      .setDesc("Usually just sqlite3, or an absolute path to the executable.")
+      .addText((text) =>
+        text
+          .setValue(config.sqlitePath)
+          .onChange(async (value) => {
+            config.sqlitePath = value.trim() || defaultSqlitePath();
+            await plugin.saveSettings();
+          }),
+      );
+    new Setting(containerEl)
+      .setName("Directories")
+      .setDesc("One OpenCode working directory per line (historical sessions).")
+      .addTextArea((text) => {
+        text
+          .setValue((config.directories || []).join("\n"))
+          .onChange(async (value) => {
+            config.directories = value
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+            await plugin.saveSettings();
+          });
+        text.inputEl.rows = 4;
+        text.inputEl.style.width = "100%";
+      });
+    new Setting(containerEl)
+      .setName("Custom SQL")
+      .setDesc("Optional SQL WHERE fragment appended after directory IN (...).")
+      .addTextArea((text) => {
+        text
+          .setPlaceholder("title LIKE '%pipeline%'")
+          .setValue(config.customSql || "")
+          .onChange(async (value) => {
+            config.customSql = value.trim();
+            await plugin.saveSettings();
+          });
+        text.inputEl.rows = 3;
+        text.inputEl.style.width = "100%";
+      });
   }
 
   renderFileFields(containerEl, connector, opts) {
@@ -4626,7 +5042,7 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
   renderAddConnector(containerEl) {
     const kindSetting = new Setting(containerEl)
       .setName("Add connector")
-      .setDesc("Each connector is a named backend. OpenCode v2 connectors are interactive (chat, models, approvals); Claude Code, Codex and Cursor connectors are read-only local transcripts.");
+      .setDesc("Each connector is a named backend. OpenCode v2 connectors are interactive (chat, models, approvals); OpenCode v1, Claude Code, Codex and Cursor connectors are read-only.");
     let selectedKind = "opencode2";
     kindSetting.addDropdown((dropdown) => {
       for (const kind of Object.values(CONNECTOR_KINDS)) {
