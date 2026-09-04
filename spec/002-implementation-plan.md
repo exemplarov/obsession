@@ -135,9 +135,13 @@ opencode instance lists its sessions and streams events independently.
 Shared infrastructure first, then one driver each. All three convert into
 the normalized message model (spec §7.2) and share:
 
-- [ ] `DirWatcher`: recursive `fs.watch` where supported (macOS/Windows),
-      2 s polling fallback (Linux), 300 ms debounce; `watch(dirs, cb)`; used
-      by all file drivers for both `watchList` and `watchSession`.
+- [ ] ~~`DirWatcher`: recursive `fs.watch`~~ **Implemented differently**: file
+      backends refresh via existing plugin machinery — dashboards re-list on
+      the global refresh interval, open chats poll `reconcileNow()` every 3 s
+      against an mtime/size-bounded parse cache (in-flight memoized, LRU 6,
+      128 MB parse cap, 200 KB per-tool-output cap). Capability reports
+      `live: "poll"`. An fs.watch-based DirWatcher can replace the poller
+      later without interface changes.
 - [ ] `FileConnectorDriver extends ConnectorDriver`: common
   - `listSessions`: enumerate root, parse headers lazily (session row needs
     only head+tail of each file: first user line, last timestamp line —
@@ -168,9 +172,11 @@ Per-format work:
       notes; `.zst` via configured `zstd -dc` (warning + skip when absent);
       title from first user `input_item` (80 chars).
 - [ ] `CursorDriver`: `~/.cursor/projects/*/agent-transcripts/<uuid>/*.jsonl`;
-      Claude-API block conversion; `turn_ended` finalization; derived title
-      from first user text; `tokens: false`, `titles: "derived"`; CLI-chat
-      metadata listing behind an option (default off, spec §11.2).
+      Claude-API block conversion; `turn_ended` finalizes open tool parts
+      (tool results are never recorded in transcripts); derived title from
+      first user text (`<user_query>` unwrapped); `tokens: false`,
+      `titles: "derived"`; CLI-chat metadata listing behind an option
+      (default off, spec §11.2) — **deferred**, revisit with Phase 5.
 - [ ] Settings cards per kind (path fields + directories), Add-connector
       dropdown now offers `claude-code`, `codex`, `cursor`.
 

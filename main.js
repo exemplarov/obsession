@@ -51,6 +51,34 @@ const CONNECTOR_KINDS = {
       customSql: "",
     }),
   },
+  "claude-code": {
+    id: "claude-code",
+    label: "Claude Code",
+    baseName: "claude",
+    createConfig: () => ({
+      projectsRoot: path.join(os.homedir(), ".claude", "projects"),
+      directories: [],
+    }),
+  },
+  codex: {
+    id: "codex",
+    label: "Codex CLI",
+    baseName: "codex",
+    createConfig: () => ({
+      sessionsRoot: path.join(os.homedir(), ".codex", "sessions"),
+      zstdPath: "zstd",
+      directories: [],
+    }),
+  },
+  cursor: {
+    id: "cursor",
+    label: "Cursor Agent",
+    baseName: "cursor",
+    createConfig: () => ({
+      projectsRoot: path.join(os.homedir(), ".cursor", "projects"),
+      directories: [],
+    }),
+  },
 };
 
 function newConnectorId() {
@@ -229,6 +257,145 @@ function runSqlite(sqlitePath, databasePath, sql) {
       },
     );
   });
+}
+
+// ---------------------------------------------------------------------------
+// File-backend helpers. Claude Code / Codex / Cursor persist sessions as
+// JSONL under a home-directory root; listing scans cheaply (head+tail of
+// each file) and chats fully parse (cached by mtime/size).
+// ---------------------------------------------------------------------------
+
+// Claude/Cursor encode the project cwd by replacing non-alphanumerics with
+// "-", which is lossy ("my-project" and "my/project" collide). Decoding
+// prefers an exact match against the user's configured directories and
+// falls back to a naive dash→separator guess for display.
+function slugifyPath(directory) {
+  return String(directory || "").replace(/[^a-zA-Z0-9]+/g, "-");
+}
+
+function decodeEncodedDir(encoded, configuredDirs = []) {
+  for (const directory of configuredDirs) {
+    if (slugifyPath(directory) === encoded) return directory;
+  }
+  const decoded = `/${String(encoded || "")
+    .replace(/^-+/, "")
+    .split("-")
+    .filter(Boolean)
+    .join("/")}`;
+  return decoded;
+}
+
+// Reads the first `headBytes` and last `tailBytes` of a file without loading
+// the middle — listing scans stay fast even on multi-MB transcripts.
+function readHeadTail(filePath, headBytes = 64 * 1024, tailBytes = 256 * 1024) {
+  const stat = fs.statSync(filePath);
+  const size = stat.size;
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const read = (start, length) => {
+      const buffer = Buffer.alloc(Math.max(0, Math.min(length, size - start)));
+      if (buffer.length <= 0) return "";
+      fs.readSync(fd, buffer, 0, buffer.length, start);
+      return buffer.toString("utf8");
+    };
+    const head = read(0, headBytes);
+    const tail = size > headBytes ? read(Math.max(0, size - tailBytes), tailBytes) : "";
+    return { head, tail, stat };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Iterates JSONL lines of a text block; malformed lines are skipped (files
+// can be truncated mid-write by a running CLI).
+function eachJsonLine(text, visit) {
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (parsed && typeof parsed === "object") visit(parsed);
+  }
+}
+
+function epochMs(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+// Session titles derived from the first user prompt (Codex/Cursor).
+// Wrapped prompts (<user_query>…</user_query>, Cursor style) are unwrapped
+// before display/title derivation.
+function extractPromptText(text) {
+  const raw = String(text || "");
+  const match = raw.match(/<user_query>([\s\S]*?)<\/user_query>/);
+  return match ? match[1].trim() : raw;
+}
+
+function deriveTitle(text) {
+  const flat = extractPromptText(text)
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!flat) return null;
+  return flat.length > 80 ? `${flat.slice(0, 77)}…` : flat;
+}
+
+// Codex injects environment context as user-role messages (AGENTS.md,
+// permissions, plugin lists — wrapped in XML-ish tags or markdown headers);
+// real prompts read as plain prose.
+function looksLikeInjectedContext(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return true;
+  return raw.startsWith("<") || raw.startsWith("# ");
+}
+
+// rollout-YYYY-MM-DDTHH-MM-SS-… → epoch ms (time dashes are colons).
+function codexFilenameTime(value) {
+  const match = /^(\d{4})-(\d\d)-(\d\d)T(\d\d)-(\d\d)-(\d\d)$/.exec(String(value || ""));
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second] = match;
+  const parsed = Date.parse(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function runExternal(command, args) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { maxBuffer: 512 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(stderr.trim() || error.message));
+      } else {
+        resolve(stdout);
+      }
+    });
+  });
+}
+
+// GUI-launched Obsidian often lacks Homebrew's bin dir on PATH; probe the
+// usual suspects for the zstd executable once and remember what worked
+// (existing absolute paths win over a bare PATH lookup).
+let zstdExecutableCache = null;
+function resolveZstdExecutable(configured) {
+  if (configured && configured !== "zstd") return configured;
+  if (zstdExecutableCache !== null) return zstdExecutableCache;
+  const candidates = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "zstd"];
+  for (const candidate of candidates) {
+    if (candidate.includes(path.sep)) {
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        zstdExecutableCache = candidate;
+        return candidate;
+      } catch {
+        continue;
+      }
+    }
+  }
+  zstdExecutableCache = "zstd"; // bare name: let PATH decide at spawn
+  return "zstd";
 }
 
 function modelLabel(value) {
@@ -1106,6 +1273,20 @@ class OpenCode2Driver extends ConnectorDriver {
     );
   }
 
+  // ----- conversation access (shared shape with file drivers) -----------------
+
+  // Both return the unwrapped shapes chat views consume: getSession → the
+  // session object, listMessages → { data, cursor: { next } } with pages
+  // newest-first (order=desc) or by cursor.
+  async getSession(sessionId) {
+    const response = await this.client.session(sessionId);
+    return response?.data || null;
+  }
+
+  async listMessages(sessionId, options = {}) {
+    return this.client.messages(sessionId, options);
+  }
+
   async loadSessionFromDb(sessionId) {
     const settings = this.config;
     if (!fs.existsSync(settings.databasePath)) {
@@ -1187,8 +1368,1006 @@ class OpenCode2Driver extends ConnectorDriver {
   }
 }
 
+// ---------------------------------------------------------------------------
+// File-based read-only connectors (Claude Code, Codex CLI, Cursor Agent).
+// Sessions live as JSONL transcripts under a home-directory root. Listing
+// head/tail-scans each file; chats fully parse with an mtime/size cache.
+// Liveness is a freshness heuristic (no SSE): recently-touched transcripts
+// whose last line suggests an open turn render as Running.
+// ---------------------------------------------------------------------------
+
+class FileConnectorDriver extends ConnectorDriver {
+  constructor(plugin, connector) {
+    super(plugin, connector);
+    // sessionId -> { mtimeMs, size, session, messages } full-parse cache
+    // (LRU-bounded: giant transcripts must not accumulate in the heap).
+    this.parseCache = new Map();
+    this.parseInflight = new Map();
+    // sessionId -> last scanned state ("running" | "idle").
+    this.sessionStates = new Map();
+  }
+
+  // Parsed transcripts can reach hundreds of MB (cold-storage rollouts);
+  // larger files are refused with a clear message instead of stalling the
+  // renderer, and tool outputs are truncated for display.
+  static MAX_PARSE_BYTES = 128 * 1024 * 1024;
+  static MAX_TOOL_OUTPUT_CHARS = 200 * 1024;
+  static PARSE_CACHE_LIMIT = 6;
+
+  capabilities() {
+    return {
+      listing: "files",
+      live: "poll",
+      messages: true,
+      pagination: true, // in-memory (synthetic offset cursors)
+      chat: false,
+      models: false,
+      permissions: false,
+      drafts: false,
+      tokens: this.supportsTokens(),
+      cost: false,
+      titles: this.supportsTitles(),
+    };
+  }
+
+  supportsTokens() {
+    return false;
+  }
+
+  supportsTitles() {
+    return "derived";
+  }
+
+  async health() {
+    const root = this.rootPath();
+    if (!root || !fs.existsSync(root)) {
+      return { ok: false, detail: `not found: ${root}` };
+    }
+    return { ok: true, detail: `${this.constructor.name} transcripts at ${root}` };
+  }
+
+  streamConnected() {
+    return false;
+  }
+
+  getLiveState(sessionId) {
+    const state = this.sessionStates.get(sessionId);
+    if (state === "running") return { status: "running", at: Date.now() };
+    return null;
+  }
+
+  dispose() {
+    this.parseCache.clear();
+    this.sessionStates.clear();
+  }
+
+  rootPath() {
+    return this.config.projectsRoot || this.config.sessionsRoot || "";
+  }
+
+  // Configured directories filter by exact cwd match; empty = everything.
+  directoryFilter() {
+    const configured = Array.isArray(this.config.directories) ? this.config.directories : [];
+    if (!configured.length) return null;
+    return new Set(configured.map((directory) => path.normalize(directory)));
+  }
+
+  decoratedRow(fields, basedir) {
+    return this.plugin.decorateRow(
+      {
+        ...fields,
+        connectorId: this.connector.id,
+        connectorName: this.connector.name,
+        source: this.connector.kind,
+        readOnly: true,
+      },
+      basedir,
+    );
+  }
+
+  async listSessions(options = {}) {
+    const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector);
+    // Block-level `dirs` act as an additional exact-match filter (parity
+    // with opencode listing); connector-configured directories do the same.
+    const wanted = new Set(
+      [...(directories.length ? directories : []), ...(this.directoryFilter() || [])].map((d) =>
+        path.normalize(d),
+      ),
+    );
+    const entries = await this.enumerateSessions();
+    const rows = [];
+    for (const entry of entries) {
+      let fields;
+      try {
+        fields = await this.scanSession(entry);
+      } catch {
+        continue; // unreadable/corrupt file: skipped, never fatal
+      }
+      if (!fields) continue;
+      // Filter AFTER scanning: codex resolves its directory from
+      // session_meta during the scan.
+      const resolvedDirectory = fields.directory || entry.directory;
+      if (wanted.size && !wanted.has(path.normalize(resolvedDirectory || ""))) continue;
+      this.sessionStates.set(entry.id, fields.state || "idle");
+      rows.push(
+        this.decoratedRow(
+          { ...entry.extra, ...fields, id: entry.id, directory: resolvedDirectory },
+          basedir,
+        ),
+      );
+    }
+    return rows.sort((a, b) => Number(b.time_updated || 0) - Number(a.time_updated || 0));
+  }
+
+  // Subclass contract ---------------------------------------------------------
+
+  // enumerateSessions() -> [{ id, file, directory, extra? }] (readdir+stat only)
+  // scanSession(entry) -> { title, model, agent, time_created, time_updated,
+  //                         tokens_*, state } via cheap head/tail reads
+  // parseSessionFile(entry) -> { session, messages } full parse
+
+  // Pinned-id lookups (widget mode): scan only the requested ids, in order.
+  async loadSessionRowsByIds(ids) {
+    const entries = await this.enumerateSessions();
+    const byId = new Map();
+    for (const entry of entries) {
+      if (!byId.has(entry.id)) byId.set(entry.id, entry);
+    }
+    const rows = [];
+    const missing = [];
+    for (const id of ids) {
+      const entry = byId.get(id);
+      if (!entry) {
+        missing.push(id);
+        continue;
+      }
+      try {
+        const fields = await this.scanSession(entry);
+        if (fields) {
+          this.sessionStates.set(id, fields.state || "idle");
+          rows.push(
+            this.decoratedRow(
+              { ...entry.extra, ...fields, id, directory: fields.directory || entry.directory },
+              "",
+            ),
+          );
+          continue;
+        }
+      } catch {
+        // fall through to missing
+      }
+      missing.push(id);
+    }
+    return { rows, missing };
+  }
+
+  async getSession(sessionId) {
+    const parsed = await this.parseSession(sessionId);
+    return parsed ? parsed.session : null;
+  }
+
+  async listMessages(sessionId, options = {}) {
+    const parsed = await this.parseSession(sessionId);
+    if (!parsed) return { data: [], cursor: { next: null } };
+    return paginateMessages(parsed.messages, options);
+  }
+
+  // Memoizes in-flight parses (loadInitial fires getSession + listMessages
+  // concurrently over the same file) and evicts old entries LRU-style.
+  parseSession(sessionId) {
+    const inflight = this.parseInflight.get(sessionId);
+    if (inflight) return inflight;
+    const promise = this.parseSessionUncached(sessionId)
+      .catch((error) => {
+        this.parseInflight.delete(sessionId);
+        throw error;
+      })
+      .then((parsed) => {
+        if (this.parseInflight.get(sessionId) === promise) this.parseInflight.delete(sessionId);
+        return parsed;
+      });
+    this.parseInflight.set(sessionId, promise);
+    return promise;
+  }
+
+  async parseSessionUncached(sessionId) {
+    const entry = await this.findSessionEntry(sessionId);
+    if (!entry) return null;
+    const stat = fs.statSync(entry.file);
+    if (stat.size > FileConnectorDriver.MAX_PARSE_BYTES) {
+      throw new Error(
+        `Session transcript is ${Math.round(stat.size / 1024 / 1024)} MB — too large to display (limit ${Math.round(FileConnectorDriver.MAX_PARSE_BYTES / 1024 / 1024)} MB).`,
+      );
+    }
+    const cached = this.parseCache.get(sessionId);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      // LRU touch: re-insert at the end.
+      this.parseCache.delete(sessionId);
+      this.parseCache.set(sessionId, cached);
+      return cached;
+    }
+    const parsed = await this.parseSessionFile(entry);
+    this.parseCache.set(sessionId, { mtimeMs: stat.mtimeMs, size: stat.size, ...parsed });
+    while (this.parseCache.size > FileConnectorDriver.PARSE_CACHE_LIMIT) {
+      const oldest = this.parseCache.keys().next().value;
+      this.parseCache.delete(oldest);
+    }
+    return parsed;
+  }
+}
+
+// Tool outputs can be enormous (command dumps, full file reads); cap them
+// for display with an explicit truncation marker.
+function capToolOutput(text) {
+  const value = String(text ?? "");
+  const limit = FileConnectorDriver.MAX_TOOL_OUTPUT_CHARS;
+  return value.length > limit
+    ? `${value.slice(0, limit)}\n… [truncated ${value.length - limit} characters]`
+    : value;
+}
+
+// Synthetic pagination over an in-memory message list: emulates the v2
+// cursor API (pages of `limit`, newest first, "next" points to older).
+function paginateMessages(messages, options = {}) {
+  const limit = Number(options.limit) > 0 ? Number(options.limit) : DEFAULT_MESSAGE_PAGE;
+  let consumed = 0;
+  if (typeof options.cursor === "string" && options.cursor.startsWith("offset:")) {
+    consumed = Math.max(0, Number(options.cursor.slice(7)) || 0);
+  }
+  const end = Math.max(0, messages.length - consumed);
+  const start = Math.max(0, end - limit);
+  const page = messages.slice(start, end).reverse(); // newest→oldest
+  const nextConsumed = consumed + page.length;
+  return {
+    data: page,
+    cursor: { next: nextConsumed < messages.length ? `offset:${nextConsumed}` : null },
+  };
+}
+
+// --- Claude Code --------------------------------------------------------------
+
+class ClaudeCodeDriver extends FileConnectorDriver {
+  supportsTokens() {
+    return true; // summed usage available on chat open (full parse)
+  }
+
+  supportsTitles() {
+    return "stored"; // ai-title lines
+  }
+
+  async health() {
+    const root = this.rootPath();
+    if (!fs.existsSync(root)) {
+      return { ok: false, detail: `not found: ${root}` };
+    }
+    return { ok: true, detail: `Claude Code transcripts at ${root}` };
+  }
+
+  async enumerateSessions() {
+    const root = this.rootPath();
+    const configured = Array.isArray(this.config.directories) ? this.config.directories : [];
+    const entries = [];
+    let projectDirs = [];
+    try {
+      projectDirs = fs.readdirSync(root, { withFileTypes: true })
+        .filter((dirent) => dirent.isDirectory())
+        .map((dirent) => dirent.name);
+    } catch {
+      return entries;
+    }
+    for (const slug of projectDirs) {
+      let files = [];
+      try {
+        files = fs.readdirSync(path.join(root, slug));
+      } catch {
+        continue;
+      }
+      for (const file of files) {
+        if (!file.endsWith(".jsonl")) continue;
+        entries.push({
+          id: file.replace(/\.jsonl$/, ""),
+          file: path.join(root, slug, file),
+          directory: decodeEncodedDir(slug, configured),
+        });
+      }
+    }
+    return entries;
+  }
+
+  async findSessionEntry(sessionId) {
+    const entries = await this.enumerateSessions();
+    return entries.find((entry) => entry.id === sessionId) || null;
+  }
+
+  // Cheap scan: title/model from the tail (latest), timestamps from both
+  // ends. Token totals need a full parse and stay empty in listings.
+  async scanSession(entry) {
+    const { head, tail, stat } = readHeadTail(entry.file, 64 * 1024, 256 * 1024);
+    let firstTime = null;
+    let lastTime = null;
+    let title = null;
+    let model = null;
+    let lastType = null;
+    const visitHead = (line) => {
+      const ts = epochMs(line.timestamp);
+      if (ts && firstTime == null) firstTime = ts;
+    };
+    const visitTail = (line) => {
+      const ts = epochMs(line.timestamp);
+      if (ts) lastTime = ts;
+      if (line.type === "ai-title" && typeof line.aiTitle === "string" && line.aiTitle) title = line.aiTitle;
+      if (line.type === "assistant" && line.message?.model) model = line.message.model;
+      if (line.type === "user" || line.type === "assistant") lastType = line.type;
+    };
+    eachJsonLine(head, visitHead);
+    eachJsonLine(tail, visitTail);
+    return {
+      title,
+      model,
+      agent: "claude-code",
+      time_created: firstTime ?? Math.round(stat.birthtimeMs),
+      time_updated: lastTime ?? Math.round(stat.mtimeMs),
+      state: this.freshnessState(stat, lastType),
+    };
+  }
+
+  freshnessState(stat, lastType) {
+    if (Date.now() - stat.mtimeMs > RUNNING_STALE_MS) return "idle";
+    // A session still awaiting its assistant reply reads as running.
+    return lastType === "user" ? "running" : "idle";
+  }
+
+  async parseSessionFile(entry) {
+    const text = fs.readFileSync(entry.file, "utf8");
+    const messages = [];
+    const usage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+    let title = null;
+    let model = null;
+    let firstTime = null;
+    let lastTime = null;
+    // tool_use_id -> { messageIndex, part } for attaching later results.
+    const pendingTools = new Map();
+    let index = 0;
+    eachJsonLine(text, (line) => {
+      const ts = epochMs(line.timestamp);
+      if (ts) {
+        if (firstTime == null) firstTime = ts;
+        lastTime = ts;
+      }
+      if (line.type === "ai-title" && line.aiTitle) {
+        title = line.aiTitle;
+        return;
+      }
+      if (line.isSidechain) return; // subagent transcripts
+      if (line.type !== "user" && line.type !== "assistant") return;
+      const message = line.message;
+      if (!message || typeof message !== "object") return;
+      if (line.type === "assistant") {
+        if (message.model) model = message.model;
+        const usageInfo = message.usage || {};
+        usage.input += Number(usageInfo.input_tokens) || 0;
+        usage.output += Number(usageInfo.output_tokens) || 0;
+        usage.reasoning += Number(usageInfo.output_tokens_details?.thinking_tokens) || 0;
+        usage.cacheRead += Number(usageInfo.cache_read_input_tokens) || 0;
+        usage.cacheWrite += Number(usageInfo.cache_creation_input_tokens) || 0;
+        const content = [];
+        const blocks = Array.isArray(message.content) ? message.content : [];
+        for (const block of blocks) {
+          if (block?.type === "text" && block.text) {
+            content.push({ type: "text", text: block.text });
+          } else if (block?.type === "thinking" && block.thinking) {
+            content.push({ type: "reasoning", text: block.thinking });
+          } else if (block?.type === "tool_use") {
+            const part = {
+              type: "tool",
+              id: block.id,
+              name: block.name || "tool",
+              state: { status: "running", input: block.input ?? {} },
+            };
+            content.push(part);
+            if (block.id) pendingTools.set(block.id, part);
+          }
+        }
+        messages.push({
+          id: line.uuid || `claude-${index}`,
+          type: "assistant",
+          agent: "claude-code",
+          model: message.model || null,
+          time: { created: ts },
+          content,
+        });
+        index += 1;
+        return;
+      }
+      // user line: plain text or tool_result blocks
+      const raw = message.content;
+      if (typeof raw === "string") {
+        messages.push({
+          id: line.uuid || `claude-${index}`,
+          type: "user",
+          time: { created: ts },
+          text: raw,
+        });
+        index += 1;
+        return;
+      }
+      if (!Array.isArray(raw)) return;
+      const textParts = [];
+      for (const block of raw) {
+        if (block?.type === "text" && block.text) {
+          textParts.push(block.text);
+        } else if (block?.type === "tool_result" && block.tool_use_id) {
+          const part = pendingTools.get(block.tool_use_id);
+          if (part) {
+            pendingTools.delete(block.tool_use_id);
+            const output = Array.isArray(block.content)
+              ? block.content.map((b) => (b?.type === "text" ? b.text : "")).filter(Boolean).join("\n")
+              : String(block.content ?? "");
+            part.state = {
+              status: block.is_error ? "error" : "completed",
+              input: part.state.input,
+              content: output ? [{ type: "text", text: capToolOutput(output) }] : [],
+            };
+          }
+        }
+      }
+      if (textParts.length) {
+        messages.push({
+          id: line.uuid || `claude-${index}`,
+          type: "user",
+          time: { created: ts },
+          text: textParts.join("\n\n"),
+        });
+        index += 1;
+      }
+    });
+    return {
+      session: {
+        id: entry.id,
+        title: title || "Untitled session",
+        agent: "claude-code",
+        model: model ? String(model) : null,
+        cost: 0,
+        tokens:
+          usage.input || usage.output || usage.reasoning || usage.cacheRead || usage.cacheWrite
+            ? {
+                input: usage.input,
+                output: usage.output,
+                reasoning: usage.reasoning,
+                cache: { read: usage.cacheRead, write: usage.cacheWrite },
+              }
+            : null,
+        time: { created: firstTime, updated: lastTime },
+        location: { directory: entry.directory },
+      },
+      messages,
+    };
+  }
+}
+
+// --- Codex CLI ------------------------------------------------------------------
+
+class CodexDriver extends FileConnectorDriver {
+  supportsTokens() {
+    return true; // cumulative token_count events
+  }
+
+  async health() {
+    const root = this.rootPath();
+    if (!fs.existsSync(root)) {
+      return { ok: false, detail: `not found: ${root}` };
+    }
+    return { ok: true, detail: `Codex CLI rollouts at ${root}` };
+  }
+
+  async enumerateSessions() {
+    const root = this.rootPath();
+    const entries = [];
+    const walk = (directory, depth) => {
+      let dirents = [];
+      try {
+        dirents = fs.readdirSync(directory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const dirent of dirents) {
+        const full = path.join(directory, dirent.name);
+        if (dirent.isDirectory() && depth < 3) {
+          walk(full, depth + 1);
+          continue;
+        }
+        const match = /^rollout-(.+)-([0-9a-fA-F-]{36})\.jsonl(\.zst)?$/.exec(dirent.name);
+        if (!match) continue;
+        entries.push({
+          id: match[2],
+          file: full,
+          compressed: !!match[3],
+          // Filename time: rollout-YYYY-MM-DDTHH-MM-SS-<uuid> (time dashes
+          // stand for colons).
+          filenameTime: codexFilenameTime(match[1]),
+          // cwd comes from session_meta during scan; placeholder until then.
+          directory: "",
+          extra: {},
+        });
+      }
+    };
+    walk(root, 0);
+    // The same session can exist as both .jsonl and .jsonl.zst (cold
+    // compression); prefer the plain file deterministically.
+    const byId = new Map();
+    for (const entry of entries) {
+      const existing = byId.get(entry.id);
+      if (!existing || (existing.compressed && !entry.compressed)) {
+        byId.set(entry.id, entry);
+      }
+    }
+    return [...byId.values()];
+  }
+
+  async findSessionEntry(sessionId) {
+    const entries = await this.enumerateSessions();
+    return entries.find((entry) => entry.id === sessionId) || null;
+  }
+
+  async readEntryText(entry, headBytes, tailBytes) {
+    if (!entry.compressed) {
+      if (headBytes || tailBytes) {
+        const { head, tail, stat } = readHeadTail(entry.file, headBytes || 64 * 1024, tailBytes || 128 * 1024);
+        return { head, tail, stat };
+      }
+      return { text: fs.readFileSync(entry.file, "utf8"), stat: fs.statSync(entry.file) };
+    }
+    const zstdPath = resolveZstdExecutable(this.config.zstdPath);
+    const text = await runExternal(zstdPath, ["-dc", entry.file]);
+    const stat = fs.statSync(entry.file);
+    if (!headBytes && !tailBytes) return { text, stat };
+    const size = text.length;
+    return {
+      head: text.slice(0, headBytes || 64 * 1024),
+      tail: size > (tailBytes || 128 * 1024) ? text.slice(-(tailBytes || 128 * 1024)) : "",
+      stat,
+    };
+  }
+
+  async scanSession(entry) {
+    if (entry.compressed) {
+      // Compressed rollouts decompress on open only; listing uses filename
+      // timestamps and a placeholder title.
+      const stat = fs.statSync(entry.file);
+      return {
+        title: null,
+        model: null,
+        agent: "codex",
+        time_created: entry.filenameTime ?? Math.round(stat.birthtimeMs),
+        time_updated: Math.round(stat.mtimeMs),
+        state: "idle",
+        compressed: true,
+      };
+    }
+    const { head, tail, stat } = await this.readEntryText(entry, 256 * 1024, 128 * 1024);
+    let cwd = null;
+    let title = null;
+    let model = null;
+    let firstTime = null;
+    let lastTime = null;
+    let tokens = null;
+    let lastSignal = null;
+    eachJsonLine(head, (line) => {
+      if (line.type === "session_meta" && line.payload?.cwd) cwd = line.payload.cwd;
+      const ts = epochMs(line.timestamp);
+      if (ts && firstTime == null) firstTime = ts;
+      if (!title && this.isUserPrompt(line)) {
+        const text = this.promptText(line);
+        if (!looksLikeInjectedContext(text)) title = deriveTitle(text);
+      }
+      if (line.type === "turn_context" && line.payload?.model) model = line.payload.model;
+    });
+    eachJsonLine(tail, (line) => {
+      const ts = epochMs(line.timestamp);
+      if (ts) lastTime = ts;
+      if (line.type === "turn_context" && line.payload?.model) model = line.payload.model;
+      const totals = line.payload?.info?.total_token_usage;
+      if (line.type === "event_msg" && line.payload?.type === "token_count" && totals) {
+        tokens = totals;
+      }
+      if (line.type === "event_msg") {
+        const kind = line.payload?.type;
+        if (kind === "task_started") lastSignal = "started";
+        else if (kind === "task_complete" || kind === "task_end" || kind === "turn_aborted") lastSignal = "ended";
+      }
+    });
+    if (cwd) entry.directory = cwd;
+    return {
+      title,
+      model,
+      agent: "codex",
+      time_created: firstTime ?? Math.round(stat.birthtimeMs),
+      time_updated: lastTime ?? Math.round(stat.mtimeMs),
+      tokens_input: tokens ? Number(tokens.input_tokens) || 0 : 0,
+      tokens_output: tokens ? Number(tokens.output_tokens) || 0 : 0,
+      tokens_reasoning: tokens ? Number(tokens.reasoning_output_tokens) || 0 : 0,
+      state: this.freshnessState(stat, lastSignal),
+    };
+  }
+
+  freshnessState(stat, lastSignal) {
+    if (Date.now() - stat.mtimeMs > RUNNING_STALE_MS) return "idle";
+    return lastSignal === "started" ? "running" : "idle";
+  }
+
+  // User prompts arrive as response_item messages with role "user" — but the
+  // CLI also injects context (AGENTS.md, permissions) as user/developer
+  // messages. Real prompts read as plain prose without the wrappers.
+  isUserPrompt(line) {
+    if (line.type === "input_item") return true;
+    if (line.type !== "response_item" || line.payload?.type !== "message") return false;
+    if (line.payload.role !== "user") return false;
+    return true;
+  }
+
+  promptText(line) {
+    if (line.type === "input_item") {
+      const payload = line.payload;
+      return String(payload?.text ?? payload?.payload?.text ?? "");
+    }
+    const content = Array.isArray(line.payload?.content) ? line.payload.content : [];
+    return content.map((block) => (block?.type === "input_text" ? block.text : "")).filter(Boolean).join("\n");
+  }
+
+  async parseSessionFile(entry) {
+    const { text } = await this.readEntryText(entry);
+    const messages = [];
+    let cwd = null;
+    let model = null;
+    let title = null;
+    let firstTime = null;
+    let lastTime = null;
+    let tokens = null;
+    // Current turn's assistant message (parts accumulate in order).
+    let turnMessage = null;
+    const toolsByCallId = new Map();
+    let index = 0;
+
+    const flushTurn = () => {
+      if (turnMessage && turnMessage.content.length) {
+        messages.push(turnMessage);
+        index += 1;
+      }
+      turnMessage = null;
+    };
+    const ensureTurn = (ts) => {
+      if (!turnMessage) {
+        turnMessage = {
+          id: `codex-turn-${index}`,
+          type: "assistant",
+          agent: "codex",
+          model: model || null,
+          time: { created: ts },
+          content: [],
+        };
+      }
+      return turnMessage;
+    };
+
+    eachJsonLine(text, (line) => {
+      const ts = epochMs(line.timestamp);
+      if (ts) {
+        if (firstTime == null) firstTime = ts;
+        lastTime = ts;
+      }
+      const payload = line.payload;
+      switch (line.type) {
+        case "session_meta":
+          cwd = payload?.cwd || cwd;
+          break;
+        case "turn_context":
+          if (payload?.model) model = payload.model;
+          break;
+        case "event_msg": {
+          const kind = payload?.type;
+          if (kind === "token_count" && payload?.info?.total_token_usage) {
+            tokens = payload.info.total_token_usage;
+          }
+          if (kind === "task_started") {
+            flushTurn();
+          } else if (kind === "task_complete" || kind === "task_end" || kind === "turn_aborted") {
+            flushTurn();
+          }
+          break;
+        }
+        case "input_item":
+        case "response_item": {
+          if (payload?.type === "message") {
+            const role = payload.role;
+            const contentText = (Array.isArray(payload.content) ? payload.content : [])
+              .map((block) => (block?.type === "output_text" || block?.type === "input_text" ? block.text : ""))
+              .filter(Boolean)
+              .join("\n");
+            if (role === "assistant") {
+              if (contentText) ensureTurn(ts).content.push({ type: "text", text: contentText });
+            } else if (!looksLikeInjectedContext(contentText) && (line.type === "input_item" || role === "user")) {
+              if (!title && contentText) title = deriveTitle(contentText);
+              flushTurn();
+              messages.push({
+                id: `codex-${index}`,
+                type: "user",
+                time: { created: ts },
+                text: contentText,
+              });
+              index += 1;
+            } else {
+              // developer / injected environment context — collapsed note
+              flushTurn();
+              messages.push({
+                id: `codex-${index}`,
+                type: "system",
+                time: { created: ts },
+                text: deriveTitle(contentText) || "context",
+              });
+              index += 1;
+            }
+          } else if (payload?.type === "reasoning") {
+            const summary = Array.isArray(payload.summary)
+              ? payload.summary.map((item) => item?.text || "").filter(Boolean).join("\n")
+              : "";
+            if (summary) ensureTurn(ts).content.push({ type: "reasoning", text: summary });
+          } else if (payload?.type === "function_call" || payload?.type === "custom_tool_call") {
+            // custom_tool_call is how apply_patch (file edits) is recorded:
+            // {call_id, name, input} instead of {call_id, name, arguments}.
+            const part = {
+              type: "tool",
+              id: payload.call_id,
+              name: payload.name || "tool",
+              state: { status: "running", input: payload.input ?? payload.arguments ?? "" },
+            };
+            ensureTurn(ts).content.push(part);
+            if (payload.call_id) toolsByCallId.set(payload.call_id, part);
+          } else if (payload?.type === "function_call_output" || payload?.type === "custom_tool_call_output") {
+            const part = payload.call_id ? toolsByCallId.get(payload.call_id) : null;
+            if (part) {
+              toolsByCallId.delete(payload.call_id);
+              part.state = {
+                status: "completed",
+                input: part.state.input,
+                content: payload.output != null
+                  ? [{ type: "text", text: capToolOutput(String(payload.output)) }]
+                  : [],
+              };
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    });
+    flushTurn();
+    if (cwd) entry.directory = cwd;
+    return {
+      session: {
+        id: entry.id,
+        title: title || "Untitled session",
+        agent: "codex",
+        model: model ? String(model) : null,
+        cost: 0,
+        tokens: tokens
+          ? {
+              input: Number(tokens.input_tokens) || 0,
+              output: Number(tokens.output_tokens) || 0,
+              reasoning: Number(tokens.reasoning_output_tokens) || 0,
+            }
+          : null,
+        time: { created: firstTime, updated: lastTime },
+        location: { directory: cwd || entry.directory },
+      },
+      messages,
+    };
+  }
+}
+
+// --- Cursor Agent (IDE transcripts) ----------------------------------------------
+
+class CursorDriver extends FileConnectorDriver {
+  supportsTokens() {
+    return false;
+  }
+
+  async health() {
+    const root = this.rootPath();
+    if (!fs.existsSync(root)) {
+      return { ok: false, detail: `not found: ${root}` };
+    }
+    return { ok: true, detail: `Cursor agent transcripts at ${root}` };
+  }
+
+  async enumerateSessions() {
+    const root = this.rootPath();
+    const configured = Array.isArray(this.config.directories) ? this.config.directories : [];
+    const entries = [];
+    let projectDirs = [];
+    try {
+      projectDirs = fs.readdirSync(root, { withFileTypes: true })
+        .filter((dirent) => dirent.isDirectory())
+        .map((dirent) => dirent.name);
+    } catch {
+      return entries;
+    }
+    for (const encoded of projectDirs) {
+      const transcriptsRoot = path.join(root, encoded, "agent-transcripts");
+      let sessionDirs = [];
+      try {
+        sessionDirs = fs.readdirSync(transcriptsRoot, { withFileTypes: true })
+          .filter((dirent) => dirent.isDirectory())
+          .map((dirent) => dirent.name);
+      } catch {
+        continue;
+      }
+      for (const sessionId of sessionDirs) {
+        const file = path.join(transcriptsRoot, sessionId, `${sessionId}.jsonl`);
+        if (!fs.existsSync(file)) continue;
+        entries.push({
+          id: sessionId,
+          file,
+          directory: decodeEncodedDir(encoded, configured),
+        });
+      }
+    }
+    return entries;
+  }
+
+  async findSessionEntry(sessionId) {
+    const entries = await this.enumerateSessions();
+    return entries.find((entry) => entry.id === sessionId) || null;
+  }
+
+  // Transcripts carry no timestamps (file stat is the only clock) and no
+  // titles (derived from the first user message). Freshness reads a small
+  // tail so the LAST line decides running/idle even in long transcripts.
+  async scanSession(entry) {
+    const { head, tail, stat } = readHeadTail(entry.file, 64 * 1024, 8 * 1024);
+    let title = null;
+    let lastType = null;
+    eachJsonLine(head, (line) => {
+      if (line.role === "user" && !title) {
+        const text = (Array.isArray(line.message?.content) ? line.message.content : [])
+          .map((block) => (block?.type === "text" ? block.text : ""))
+          .filter(Boolean)
+          .join("\n");
+        title = deriveTitle(text);
+      }
+    });
+    const tailLines = tail ? String(tail).split(/\r?\n/).filter((l) => l.trim()) : [];
+    const visitLast = (line) => {
+      if (line.role) lastType = line.role;
+      if (line.type === "turn_ended") lastType = "turn_ended";
+    };
+    // Prefer the true last line from the tail; fall back to the head for
+    // small files (readHeadTail returns an empty tail then).
+    if (tailLines.length) {
+      for (let i = tailLines.length - 1; i >= 0; i -= 1) {
+        try {
+          visitLast(JSON.parse(tailLines[i]));
+          break;
+        } catch {
+          continue;
+        }
+      }
+    } else {
+      eachJsonLine(head, visitLast);
+    }
+    return {
+      title,
+      model: null,
+      agent: "cursor-agent",
+      time_created: Math.round(stat.birthtimeMs),
+      time_updated: Math.round(stat.mtimeMs),
+      state: this.freshnessState(stat, lastType),
+    };
+  }
+
+  freshnessState(stat, lastType) {
+    if (Date.now() - stat.mtimeMs > RUNNING_STALE_MS) return "idle";
+    return lastType === "assistant" ? "running" : "idle";
+  }
+
+  async parseSessionFile(entry) {
+    const text = fs.readFileSync(entry.file, "utf8");
+    const messages = [];
+    let title = null;
+    const lines = String(text || "").split(/\r?\n/);
+    for (let lineNumber = 0; lineNumber < lines.length; lineNumber += 1) {
+      const trimmed = lines[lineNumber].trim();
+      if (!trimmed) continue;
+      let line;
+      try {
+        line = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      if (!line || typeof line !== "object") continue;
+      if (line.type === "turn_ended") {
+        // Transcripts record at most one turn_ended per file (a clean end);
+        // with no tool outputs persisted, finalize all open tools there.
+        for (const message of messages) {
+          for (const part of message.content || []) {
+            if (part.type === "tool" && part.state.status === "running") {
+              part.state.status = "completed";
+            }
+          }
+        }
+        continue;
+      }
+      if (!line.role) continue;
+      const blocks = Array.isArray(line.message?.content) ? line.message.content : [];
+      if (line.role === "user") {
+        const textParts = blocks
+          .map((block) => (block?.type === "text" ? block.text : ""))
+          .filter(Boolean);
+        if (textParts.length) {
+          if (!title) title = deriveTitle(textParts.join("\n"));
+          messages.push({
+            id: `cursor-l${lineNumber}`,
+            type: "user",
+            time: null,
+            text: extractPromptText(textParts.join("\n\n")),
+          });
+        }
+        continue;
+      }
+      if (line.role === "assistant") {
+        const content = [];
+        for (const block of blocks) {
+          if (block?.type === "text" && block.text) {
+            content.push({ type: "text", text: block.text });
+          } else if (block?.type === "tool_use") {
+            content.push({
+              type: "tool",
+              id: block.id || `cursor-tool-${lineNumber}-${content.length}`,
+              name: block.name || "tool",
+              // Transcripts never record tool outputs; inputs are final.
+              state: { status: "running", input: block.input ?? {} },
+            });
+          }
+        }
+        if (content.length) {
+          messages.push({
+            id: `cursor-l${lineNumber}`,
+            type: "assistant",
+            agent: "cursor-agent",
+            model: null,
+            time: null,
+            content,
+          });
+        }
+      }
+    }
+    return {
+      session: {
+        id: entry.id,
+        title: title || "Untitled session",
+        agent: "cursor-agent",
+        model: null,
+        cost: 0,
+        tokens: null,
+        time: {
+          created: Math.round(fs.statSync(entry.file).birthtimeMs),
+          updated: Math.round(fs.statSync(entry.file).mtimeMs),
+        },
+        location: { directory: entry.directory },
+      },
+      messages,
+    };
+  }
+}
+
 function createDriverFor(plugin, connector) {
   switch (connector.kind) {
+    case "claude-code":
+      return new ClaudeCodeDriver(plugin, connector);
+    case "codex":
+      return new CodexDriver(plugin, connector);
+    case "cursor":
+      return new CursorDriver(plugin, connector);
     case "opencode2":
     default:
       return new OpenCode2Driver(plugin, connector);
@@ -1379,10 +2558,23 @@ class SessionsDashboard {
       });
       const refreshButton = toolbar.createEl("button", { text: "Refresh" });
       refreshButton.addEventListener("click", () => this.load());
-      const newButton = toolbar.createEl("button", { text: "New session" });
-      newButton.addEventListener("click", () =>
-        this.plugin.newSession({ dirs: this.options.dirs, basedir: this.options.basedir }),
-      );
+      // New sessions need a drafts-capable connector (OpenCode v2).
+      let draftsCapable = false;
+      try {
+        draftsCapable = !!this.plugin.driverForOptions({})?.capabilities().drafts;
+      } catch {
+        draftsCapable = false;
+      }
+      if (draftsCapable) {
+        const newButton = toolbar.createEl("button", { text: "New session" });
+        newButton.addEventListener("click", () =>
+          this.plugin.newSession({
+            dirs: this.options.dirs,
+            basedir: this.options.basedir,
+            connector: this.requestedConnectorName || undefined,
+          }),
+        );
+      }
       if (this.options.showSettings) {
         const settingsButton = toolbar.createEl("button", { text: "Settings" });
         settingsButton.addEventListener("click", () => this.plugin.openSettings());
@@ -1478,7 +2670,16 @@ class SessionsDashboard {
       ? filtered
       : filtered.slice(0, Math.max(this.visible, this.pinnedSessionIds().length));
     if (this.statusEl) {
-      const live = this.driver()?.streamConnected() ? " · live" : " · offline (db)";
+      let live;
+      try {
+        live = this.driver()?.capabilities().listing === "files"
+          ? " · watching files"
+          : this.driver()?.streamConnected()
+            ? " · live"
+            : " · offline (db)";
+      } catch {
+        live = "";
+      }
       const via = this.connectorLabel() ? ` · via ${this.connectorLabel()}` : "";
       this.statusEl.setText(
         `${filtered.length} of ${this.sessions.length} session${filtered.length === 1 ? "" : "s"}${live}${via}`,
@@ -1729,6 +2930,30 @@ class SessionChatView extends ItemView {
     return super.setState ? super.setState(state) : undefined;
   }
 
+  // Cache the capability descriptor per view; a broken driver must not
+  // take the chat down with it.
+  driverCapabilities() {
+    if (!this.capsCache) {
+      try {
+        this.capsCache = this.driver?.capabilities() || {};
+      } catch {
+        this.capsCache = {};
+      }
+    }
+    return this.capsCache;
+  }
+
+  // File connectors have no event stream; a light poll reconciles the chat
+  // (the parse cache makes untouched files free).
+  startPollingIfFileBacked() {
+    if (this.filePollTimer || !(this.driver instanceof FileConnectorDriver)) return;
+    if (!this.driverCapabilities().messages) return;
+    this.filePollTimer = window.setInterval(() => {
+      if (this.unsubscribed) return;
+      this.reconcileNow().catch(() => {});
+    }, 3000);
+  }
+
   async onOpen() {
     this.contentEl.empty();
     this.contentEl.addClass("opencode-session-view");
@@ -1744,6 +2969,7 @@ class SessionChatView extends ItemView {
       this.buildSkeleton();
       this.bindSession(this.sessionId);
       this.unsubscribeStream = this.plugin.subscribe(() => this.updateComposer());
+      this.startPollingIfFileBacked();
       await this.loadInitial();
       return;
     }
@@ -1777,6 +3003,10 @@ class SessionChatView extends ItemView {
     this.unsubscribed = true;
     if (this.unsubscribeEvents) this.unsubscribeEvents();
     if (this.unsubscribeStream) this.unsubscribeStream();
+    if (this.filePollTimer) {
+      window.clearInterval(this.filePollTimer);
+      this.filePollTimer = null;
+    }
     if (this.reconcileTimer) window.clearTimeout(this.reconcileTimer);
   }
 
@@ -1840,6 +3070,29 @@ class SessionChatView extends ItemView {
     this.permissionEl.style.display = "none";
 
     const composer = contentEl.createDiv({ cls: "oc-composer" });
+    const caps = this.driverCapabilities();
+    this.readOnly = !caps.chat;
+    if (this.readOnly) {
+      // Read-only connectors (file backends): no composer, just a notice.
+      composer.addClass("oc-composer-readonly");
+      composer.createDiv({
+        cls: "oc-readonly-note",
+        text: "Read-only connector — this view shows recorded history; prompting applies to OpenCode connectors.",
+      });
+      this.inputEl = composer.createEl("textarea", { cls: "oc-input", attr: { rows: "1" } });
+      this.inputEl.style.display = "none";
+      this.inputEl.disabled = true;
+      const actions = composer.createDiv({ cls: "oc-composer-actions" });
+      this.modelSelect = actions.createEl("select", { cls: "oc-model-select" });
+      this.modelSelect.style.display = "none";
+      this.hintEl = actions.createSpan({ cls: "oc-hint", text: "" });
+      this.stopButton = actions.createEl("button", { cls: "oc-stop", text: "Stop" });
+      this.stopButton.style.display = "none";
+      this.sendButton = actions.createEl("button", { cls: "oc-send", text: "Send" });
+      this.sendButton.style.display = "none";
+      this.updateComposer();
+      return;
+    }
     this.inputEl = composer.createEl("textarea", {
       cls: "oc-input",
       attr: { placeholder: "Message this session… (Enter to send, Shift+Enter for newline)", rows: "1" },
@@ -1871,12 +3124,14 @@ class SessionChatView extends ItemView {
 
   setOffline(offline, reason = "") {
     this.offline = offline;
-    const prefix = `Server unreachable${reason ? ` — ${reason}` : ""}`;
+    const detail = this.driver instanceof FileConnectorDriver
+      ? `Could not read this session's transcript${reason ? ` — ${reason}` : ""}. It may have been moved, deleted, or is too large; retrying.`
+      : `Server unreachable${reason ? ` — ${reason}` : ""}`;
     this.offlineEl.setText(
       offline
         ? this.driver?.databaseUsable()
-          ? `${prefix}. Showing messages from the local database (read-only).`
-          : `${prefix}. History is unavailable until the server returns.`
+          ? `${detail}. Showing messages from the local database (read-only).`
+          : `${detail}. ${this.driver instanceof FileConnectorDriver ? "" : "History is unavailable until the server returns."}`
         : "",
     );
     this.offlineEl.style.display = offline ? "" : "none";
@@ -1884,6 +3139,16 @@ class SessionChatView extends ItemView {
   }
 
   updateComposer() {
+    if (this.readOnly) {
+      if (this.hintEl) {
+        this.hintEl.setText(
+          this.driver instanceof FileConnectorDriver
+            ? `History from ${this.connector?.name || "this connector"} — refreshed every few seconds`
+            : "Read-only — input is unavailable for this connector",
+        );
+      }
+      return;
+    }
     const connected = this.driver?.streamConnected() || false;
     this.sendButton.disabled = !!this.offline || !this.inputEl?.value?.trim();
     this.stopButton.disabled = !!this.offline || !this.busy;
@@ -1921,13 +3186,23 @@ class SessionChatView extends ItemView {
       return;
     }
     const live = this.driver?.getLiveState(this.sessionId) || null;
-    const state = this.pendingPermission
-      ? "waiting"
-      : this.busy
-        ? "running"
-        : live && live.status !== "running"
+    let state;
+    if (this.pendingPermission) {
+      state = "waiting";
+    } else if (this.busy) {
+      state = "running";
+    } else if (live) {
+      // v2 streams carry terminal states (interrupted/error); a live
+      // "running" without local busy tracking reads as idle there. File
+      // drivers only report running when a transcript is genuinely active.
+      state = this.driver instanceof FileConnectorDriver
+        ? live.status || "idle"
+        : live.status !== "running"
           ? live.status
           : "idle";
+    } else {
+      state = "idle";
+    }
     this.badgeEl.className = `opencode-sessions-badge opencode-sessions-badge-${state}`;
     this.badgeEl.setText(STATE_LABELS[state] || "");
   }
@@ -1975,16 +3250,16 @@ class SessionChatView extends ItemView {
   async loadInitial() {
     const seq = ++this.loadSeq;
     try {
-      const [sessionResponse, messagesResponse] = await Promise.all([
-        this.driver.client.session(this.sessionId),
+      const [session, messagesResponse] = await Promise.all([
+        this.driver.getSession(this.sessionId),
         // Newest page first: order=desc guarantees the latest messages are
         // included even in long sessions (order=asc&limit returns the
         // OLDEST page — sessions over the limit lose their tail).
-        this.driver.client.messages(this.sessionId, { limit: DEFAULT_MESSAGE_PAGE, order: "desc" }),
+        this.driver.listMessages(this.sessionId, { limit: DEFAULT_MESSAGE_PAGE, order: "desc" }),
       ]);
       if (this.unsubscribed || seq !== this.loadSeq) return;
       this.setOffline(false);
-      this.session = sessionResponse?.data || null;
+      this.session = session;
       this.resetMessages();
       this.appendMessages(
         [...(messagesResponse?.data || [])].reverse(),
@@ -2026,7 +3301,7 @@ class SessionChatView extends ItemView {
   // falling back to the server's location-aware default), then every
   // available model grouped by provider, variants expanded inline.
   async loadModels() {
-    if (!this.modelSelect) return;
+    if (!this.modelSelect || !this.driverCapabilities().models) return;
     const directory = this.session?.location?.directory || this.draftDirectory;
     let models = [];
     let defaultRef = null;
@@ -2192,8 +3467,13 @@ class SessionChatView extends ItemView {
     else await this.refresh(false);
   }
 
-  // Offline fallback: session row + messages straight from SQLite.
+  // Offline fallback: session row + messages straight from SQLite
+  // (OpenCode v2 connectors only; file backends surface the load error).
   async loadFromDb() {
+    if (typeof this.driver?.loadMessagesFromDb !== "function") {
+      this.metaEl.setText("Could not load session — this connector has no offline fallback.");
+      return;
+    }
     try {
       const row = await this.driver.loadSessionFromDb(this.sessionId);
       if (row) {
@@ -2285,9 +3565,11 @@ class SessionChatView extends ItemView {
     }
     if (msg.type === "assistant") {
       const meta = el.createDiv({ cls: "oc-msg-meta" });
-      meta.createSpan({ cls: "oc-msg-agent", text: msg.agent || "assistant" });
-      if (msg.model) meta.appendText(` · ${modelLabel(msg.model)}`);
-      meta.appendText(` · ${formatTime(msg.time?.created || msg.time?.streamed)}`);
+      const metaParts = [msg.agent || "assistant"];
+      if (msg.model) metaParts.push(modelLabel(msg.model));
+      const timeLabel = formatTime(msg.time?.created || msg.time?.streamed);
+      if (timeLabel) metaParts.push(timeLabel);
+      meta.setText(metaParts.join(" · "));
       if (msg.error) {
         el.createDiv({
           cls: "oc-msg-error",
@@ -2537,6 +3819,7 @@ class SessionChatView extends ItemView {
   // was already waiting, or a reply made while this tab was reconnecting).
   async refreshPendingPermission() {
     if (!this.sessionId || !this.driver || this.offline) return;
+    if (!this.driverCapabilities().permissions) return;
     try {
       const response = await this.driver.client.sessionPermissions(this.sessionId);
       if (this.unsubscribed) return;
@@ -2750,22 +4033,29 @@ class SessionChatView extends ItemView {
   // Non-destructive reconcile: upserts latest messages + session header
   // without resetting the DOM (safe mid-stream, after reconnect, on focus).
   async reconcileNow() {
-    if (this.unsubscribed || this.offline || !this.sessionId || !this.driver || this.isDraft()) return;
+    if (this.unsubscribed || !this.sessionId || !this.driver || this.isDraft()) return;
+    // v2 skips reconciling while the server is known-down (events will
+    // recover it); file drivers keep retrying — reads are local and cheap.
+    if (this.driver instanceof OpenCode2Driver && this.offline) return;
     try {
-      const limit = Math.max(DEFAULT_MESSAGE_PAGE, this.messages.size);
-      const response = await this.driver.client.messages(this.sessionId, { limit, order: "desc" });
+      // Cap the reconcile window: catching new tail messages does not
+      // require re-fetching unbounded history every few seconds.
+      const limit = Math.min(Math.max(DEFAULT_MESSAGE_PAGE, this.messages.size), 300);
+      const response = await this.driver.listMessages(this.sessionId, { limit, order: "desc" });
       if (this.unsubscribed) return;
       for (const message of [...(response?.data || [])].reverse()) {
         this.upsertMessage(message);
       }
-      const sessionResponse = await this.driver.client.session(this.sessionId).catch(() => null);
-      if (!this.unsubscribed && sessionResponse?.data) {
-        this.session = sessionResponse.data;
+      const session = await this.driver.getSession(this.sessionId).catch(() => null);
+      if (!this.unsubscribed && session) {
+        this.session = session;
         this.renderHeader();
       }
       this.lastLoadedAt = Date.now();
       if (this.offline) this.setOffline(false);
-      this.refreshPendingPermission().catch(() => {});
+      if (this.driverCapabilities().permissions) {
+        this.refreshPendingPermission().catch(() => {});
+      }
     } catch {
       // ignore — the next event or manual refresh will retry
     }
@@ -2780,8 +4070,9 @@ class SessionChatView extends ItemView {
     const beforeTop = chat.scrollTop;
     try {
       // Cursor-only request (cursors must not combine with order); pages
-      // continue toward older messages in newest→oldest order.
-      const response = await this.driver.client.messages(this.sessionId, {
+      // continue toward older messages in newest→oldest order. File
+      // connectors use synthetic offset cursors over the parsed transcript.
+      const response = await this.driver.listMessages(this.sessionId, {
         limit: DEFAULT_MESSAGE_PAGE,
         cursor: this.cursorOlder,
       });
@@ -3119,12 +4410,21 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
         return;
       }
       try {
-        const { detail } = await currentDriver.health();
-        const endpoint = currentDriver.client.endpoint;
-        const overrideMark = endpoint?.override ? " (override)" : "";
-        statusEl.setText(
-          `Connected${endpoint ? ` to ${endpoint.baseUrl}` : ""}${overrideMark} — ${detail}. Event stream: ${currentDriver.streamConnected() ? "live" : "connecting…"}. Listing: ${currentDriver.databaseUsable() ? "SQLite" : "API"}.`,
-        );
+        const health = await currentDriver.health();
+        if (health && health.ok === false) {
+          statusEl.setText(`Problem — ${health.detail || "connector is not usable"}.`);
+        } else {
+          const detail = health?.detail || "";
+          let endpointLine = "";
+          if (currentDriver instanceof OpenCode2Driver) {
+            const endpoint = currentDriver.client.endpoint;
+            const overrideMark = endpoint?.override ? " (override)" : "";
+            endpointLine = `${endpoint ? ` to ${endpoint.baseUrl}` : ""}${overrideMark} — ${detail}. Event stream: ${currentDriver.streamConnected() ? "live" : "connecting…"}. Listing: ${currentDriver.databaseUsable() ? "SQLite" : "API"}.`;
+          } else {
+            endpointLine = ` — ${detail}. Read-only; refreshed on interval.`;
+          }
+          statusEl.setText(`Connected${endpointLine}`);
+        }
       } catch {
         statusEl.setText(
           currentDriver.databaseUsable()
@@ -3144,7 +4444,71 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
     const body = card.createDiv({ cls: "opencode-connector-card-body" });
     if (connector.kind === "opencode2") {
       this.renderOpenCode2Fields(body, connector, driver);
+    } else if (connector.kind === "codex") {
+      this.renderFileFields(body, connector, {
+        rootKey: "sessionsRoot",
+        rootName: "Sessions root",
+        rootDesc: "Codex rollout directory (default ~/.codex/sessions).",
+        zstd: true,
+      });
+    } else {
+      this.renderFileFields(body, connector, {
+        rootKey: "projectsRoot",
+        rootName: "Projects root",
+        rootDesc:
+          connector.kind === "claude-code"
+            ? "Claude Code projects directory (default ~/.claude/projects)."
+            : "Cursor projects directory (default ~/.cursor/projects).",
+        zstd: false,
+      });
     }
+  }
+
+  renderFileFields(containerEl, connector, opts) {
+    const plugin = this.plugin;
+    const config = connector.config;
+    new Setting(containerEl)
+      .setName(opts.rootName)
+      .setDesc(opts.rootDesc)
+      .addText((text) =>
+        text
+          .setValue(config[opts.rootKey] || "")
+          .onChange(async (value) => {
+            config[opts.rootKey] = value.trim();
+            await plugin.saveSettings();
+          }),
+      );
+    if (opts.zstd) {
+      new Setting(containerEl)
+        .setName("zstd executable")
+        .setDesc("Used to read compressed (.jsonl.zst) rollouts. Compressed sessions list normally and decompress when opened; without zstd they fail to open with a clear error.")
+        .addText((text) =>
+          text
+            .setValue(config.zstdPath || "zstd")
+            .onChange(async (value) => {
+              config.zstdPath = value.trim() || "zstd";
+              await plugin.saveSettings();
+            }),
+        );
+    }
+    new Setting(containerEl)
+      .setName("Directories")
+      .setDesc(
+        "Optional filter — one project directory per line; empty lists everything. Entries also disambiguate Claude/Cursor's lossy encoded project names.",
+      )
+      .addTextArea((text) => {
+        text
+          .setValue((config.directories || []).join("\n"))
+          .onChange(async (value) => {
+            config.directories = value
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+            await plugin.saveSettings();
+          });
+        text.inputEl.rows = 4;
+        text.inputEl.style.width = "100%";
+      });
   }
 
   renderOpenCode2Fields(containerEl, connector, driver) {
@@ -3262,7 +4626,7 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
   renderAddConnector(containerEl) {
     const kindSetting = new Setting(containerEl)
       .setName("Add connector")
-      .setDesc("Each connector is a named backend — more kinds (Claude Code, Codex, Cursor, OpenCode v1) arrive in upcoming releases.");
+      .setDesc("Each connector is a named backend. OpenCode v2 connectors are interactive (chat, models, approvals); Claude Code, Codex and Cursor connectors are read-only local transcripts.");
     let selectedKind = "opencode2";
     kindSetting.addDropdown((dropdown) => {
       for (const kind of Object.values(CONNECTOR_KINDS)) {
@@ -3621,7 +4985,9 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       enabled: true,
       config: kind.createConfig(),
     });
-    if (!connector.config.directories.length && this.vaultRoot) {
+    // OpenCode v2 defaults its directories to the vault (listing needs a
+    // scope); file backends list everything until directories are set.
+    if (connector.kind === "opencode2" && !connector.config.directories.length && this.vaultRoot) {
       connector.config.directories = [this.vaultRoot];
     }
     this.settings.connectors.push(connector);
@@ -3747,6 +5113,17 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
   // New-session flow: single configured directory goes straight to a draft
   // chat; several open the directory picker.
   async newSession(options = {}) {
+    const driver = this.driverForOptions(options);
+    let draftsCapable = false;
+    try {
+      draftsCapable = !!driver?.capabilities().drafts;
+    } catch {
+      draftsCapable = false;
+    }
+    if (!draftsCapable) {
+      new Notice("New sessions need an OpenCode v2 connector — set one as the default connector in settings.");
+      return;
+    }
     const { directories } = this.resolveDirectories(options);
     if (!directories.length) {
       new Notice("No directories configured — add them in OpenCode Sessions settings.");
