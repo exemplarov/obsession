@@ -4735,6 +4735,21 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
     const entry = plugin.registry.get(connector.id);
     const driver = entry?.driver || null;
 
+    let caps = {};
+    try {
+      caps = driver?.capabilities() || {};
+    } catch {
+      caps = {};
+    }
+    if (caps.chat) {
+      head.createSpan({ cls: "opencode-connector-badge", text: "interactive · live" });
+    } else {
+      head.createSpan({
+        cls: "opencode-connector-badge opencode-connector-badge-readonly",
+        text: caps.live === "none" ? "read-only · historical" : "read-only",
+      });
+    }
+
     const toggleWrap = head.createDiv({ cls: "opencode-connector-toggle" });
     const toggleLabel = toggleWrap.createSpan({ text: "Enabled", cls: "opencode-connector-toggle-label" });
     const toggle = toggleWrap.createEl("input", { type: "checkbox" });
@@ -5088,7 +5103,37 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.registry.init();
 
     this.api = {
-      apiVersion: 3,
+      apiVersion: 4,
+      // Per-connector namespace: api.connector("claude").list({}) …
+      connectors: () =>
+        this.registry.all().map(({ connector, driver }) => ({
+          id: connector.id,
+          name: connector.name,
+          kind: connector.kind,
+          enabled: connector.enabled,
+          capabilities: safeCapabilities(driver),
+        })),
+      defaultConnector: () => this.registry.defaultConnector()?.connector.name || null,
+      connector: (name) => {
+        const entry = this.registry.byName(name);
+        if (!entry) throw new Error(`Unknown connector: ${name}`);
+        const driver = entry.driver;
+        const requireV2 = () => {
+          if (!(driver instanceof OpenCode2Driver)) {
+            throw new Error(`Connector "${name}" is read-only (${entry.connector.kind})`);
+          }
+          return driver;
+        };
+        return {
+          info: () => ({ id: entry.connector.id, name: entry.connector.name, kind: entry.connector.kind, enabled: entry.connector.enabled, capabilities: safeCapabilities(driver) }),
+          health: () => driver.health(),
+          list: (query = {}) => driver.listSessions({ ...query, connector: name }),
+          session: (sessionId) => driver.getSession(sessionId),
+          messages: (sessionId, options) => driver.listMessages(sessionId, options),
+          prompt: (sessionId, text) => requireV2().client.prompt(sessionId, text),
+          stop: (sessionId) => requireV2().client.interrupt(sessionId),
+        };
+      },
       list: (query) => this.loadSessions(query),
       listSessions: (query) => this.loadSessions(query),
       refresh: async () => {

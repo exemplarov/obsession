@@ -345,6 +345,19 @@
   font-size: var(--font-ui-smaller);
 }
 
+.opencode-connector-badge {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+  border-radius: 999px;
+  padding: 0.05rem 0.5rem;
+}
+
+.opencode-connector-badge-readonly {
+  color: var(--text-muted);
+  background: var(--background-modifier-hover);
+}
+
 .opencode-connector-name {
   width: 12rem;
 }
