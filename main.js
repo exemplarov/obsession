@@ -280,13 +280,20 @@ function runSqlite(sqlitePath, databasePath, sql) {
 // "-", which is lossy ("my-project" and "my/project" collide). Decoding
 // prefers an exact match against the user's configured directories and
 // falls back to a naive dash→separator guess for display.
+// Claude keeps the leading dash ("-Users-roman-…") while Cursor drops it
+// ("Users-roman-…"), so slugs compare with edge hyphens trimmed — one slug
+// table matches both backends' encodings.
 function slugifyPath(directory) {
-  return String(directory || "").replace(/[^a-zA-Z0-9]+/g, "-");
+  return String(directory || "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function trimSlugEdges(value) {
+  return String(value || "").replace(/^-+|-+$/g, "");
 }
 
 function decodeEncodedDir(encoded, configuredDirs = []) {
   for (const directory of configuredDirs) {
-    if (slugifyPath(directory) === encoded) return directory;
+    if (slugifyPath(directory) === trimSlugEdges(encoded)) return directory;
   }
   const decoded = `/${String(encoded || "")
     .replace(/^-+/, "")
@@ -301,7 +308,7 @@ function decodeEncodedDir(encoded, configuredDirs = []) {
 // to "forty/two". Real-cwd backends (Codex) match by path.
 function directoryMatchesFilter(entry, wantedPaths, wantedSlugs) {
   if (!wantedPaths.size) return true;
-  if (entry.encodedDir) return wantedSlugs.has(entry.encodedDir);
+  if (entry.encodedDir) return wantedSlugs.has(trimSlugEdges(entry.encodedDir));
   return wantedPaths.has(path.normalize(entry.directory || ""));
 }
 
@@ -310,7 +317,7 @@ function directoryMatchesFilter(entry, wantedPaths, wantedSlugs) {
 function displayDirectoryFor(entry, wantedPaths) {
   if (entry.encodedDir) {
     for (const wanted of wantedPaths) {
-      if (slugifyPath(wanted) === entry.encodedDir) return wanted;
+      if (slugifyPath(wanted) === trimSlugEdges(entry.encodedDir)) return wanted;
     }
   }
   return entry.directory;

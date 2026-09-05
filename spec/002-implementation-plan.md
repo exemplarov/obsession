@@ -153,7 +153,8 @@ the normalized message model (spec §7.2) and share:
   - Message ids stable per format (`uuid` line field for claude;
     `file:line` for codex/cursor).
   - Directory decode helper `matchEncodedDir(encoded, configuredDirs)`:
-    slugify each configured dir and compare; fallback label = encoded string.
+    slugify each configured dir and compare (edge hyphens trimmed — Claude
+    keeps the leading dash, Cursor drops it); fallback label = encoded string.
   - `capabilities()`: `chat: false, models: false, permissions: false,
     drafts: false, live: "fs-watch"`, `titles`/`tokens` per format.
 - [ ] Chat view degradation: composer → "Read-only connector" notice when

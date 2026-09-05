@@ -445,6 +445,9 @@ api.config()                        // v3 fields + { connectors: [...], defaultC
   (`text`, `tool_use{name,input}`, `tool_result`), plus
   `{type:"turn_ended", status}` markers. **No per-message timestamps, no
   titles, no model/tokens.** Primary target for the `cursor` connector.
+  Encoded cwd differs from Claude's: Claude keeps the leading dash
+  (`-Users-roman-…`) while Cursor drops it (`Users-roman-…`); slug
+  comparisons trim edge hyphens so one slug table matches both.
 - CLI chats: `~/.cursor/chats/<project-hash>/<session-uuid>/` containing
   `meta.json` (`{title, cwd, createdAtMs, updatedAtMs}` — clean and useful)
   and `store.db` (SQLite: `blobs(id, data)`, `meta`). The conversation body
