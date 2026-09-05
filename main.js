@@ -24,6 +24,7 @@ const STATE_LABELS = {
   suspended: "Suspended",
   idle: "Idle",
   waiting: "Needs approval",
+  question: "Needs answer",
   interrupted: "Interrupted",
   error: "Error",
   "": "",
@@ -844,6 +845,147 @@ class OpenCodeClient {
     );
   }
 
+  // ----- agent questions (the `question` tool) -------------------------------
+  //
+  // Two server generations expose these differently; both are normalized:
+  //  - "form": GET /api/session/:id/form + reply/cancel — the question tool
+  //    surfaces as a form with fields q0, q1, … (answers keyed by field)
+  //  - "question": GET /api/session/:id/question + reply/reject — newer v2
+  //    servers (answers ordered per question, each an array of labels)
+  // The available protocol is probed once per server and cached.
+
+  sessionForms(sessionId) {
+    return this.request(`/api/session/${encodeURIComponent(sessionId)}/form`);
+  }
+
+  replyForm(sessionId, formId, answer) {
+    return this.request(
+      `/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}/reply`,
+      { method: "POST", body: { answer } },
+    );
+  }
+
+  cancelForm(sessionId, formId) {
+    return this.request(
+      `/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}/cancel`,
+      { method: "POST" },
+    );
+  }
+
+  sessionQuestions(sessionId) {
+    return this.request(`/api/session/${encodeURIComponent(sessionId)}/question`);
+  }
+
+  replyQuestionRequest(sessionId, requestId, answers) {
+    return this.request(
+      `/api/session/${encodeURIComponent(sessionId)}/question/${encodeURIComponent(requestId)}/reply`,
+      { method: "POST", body: { answers } },
+    );
+  }
+
+  rejectQuestionRequest(sessionId, requestId) {
+    return this.request(
+      `/api/session/${encodeURIComponent(sessionId)}/question/${encodeURIComponent(requestId)}/reject`,
+      { method: "POST" },
+    );
+  }
+
+  // Pending question batches normalized to one shape:
+  // { protocol, id, sessionID, title, questions: [{ key, header, question,
+  //   multiple, boolean, numeric, external, custom,
+  //   options: [{ label, value, description }] }] }
+  async pendingQuestions(sessionId) {
+    if (this.questionProtocol === "question") {
+      return this.normalizeQuestionRequests(await this.sessionQuestions(sessionId));
+    }
+    if (this.questionProtocol === "form") {
+      return this.normalizeForms(await this.sessionForms(sessionId));
+    }
+    try {
+      const forms = await this.sessionForms(sessionId);
+      this.questionProtocol = "form";
+      return this.normalizeForms(forms);
+    } catch (error) {
+      if (!String(error.message).startsWith("404")) throw error;
+      const questions = await this.sessionQuestions(sessionId);
+      this.questionProtocol = "question";
+      return this.normalizeQuestionRequests(questions);
+    }
+  }
+
+  normalizeForms(response) {
+    return (response?.data || []).filter(Boolean).map((form) => ({
+      protocol: "form",
+      id: form.id,
+      sessionID: form.sessionID || "",
+      title: form.title || "Questions",
+      questions: (form.fields || []).map((field) => ({
+        key: field.key,
+        header: field.title || field.key,
+        question: field.description || "",
+        multiple: field.type === "multiselect",
+        boolean: field.type === "boolean",
+        numeric: field.type === "number" || field.type === "integer",
+        external: field.type === "external",
+        custom: field.custom !== false,
+        options: (field.options || []).map((option) => ({
+          label: option.label ?? option.value,
+          value: option.value ?? option.label,
+          description: option.description || "",
+        })),
+      })),
+    }));
+  }
+
+  normalizeQuestionRequests(response) {
+    return (response?.data || []).filter(Boolean).map((request) => ({
+      protocol: "question",
+      id: request.id,
+      sessionID: request.sessionID || "",
+      title: "Questions",
+      questions: (request.questions || []).map((question, index) => ({
+        key: `q${index}`,
+        header: question.header || `Question ${index + 1}`,
+        question: question.question || "",
+        multiple: question.multiple === true,
+        boolean: false,
+        numeric: false,
+        external: false,
+        custom: question.custom !== false,
+        options: (question.options || []).map((option) => ({
+          label: option.label,
+          value: option.label,
+          description: option.description || "",
+        })),
+      })),
+    }));
+  }
+
+  // Submits normalized answers (question key -> option value(s), custom text,
+  // boolean, or number) using the protocol the request was loaded with.
+  async replyPendingQuestions(sessionId, pending, answers) {
+    if (pending.protocol === "question") {
+      const ordered = pending.questions.map((question) => {
+        const value = answers.get(question.key);
+        if (Array.isArray(value)) return value;
+        return value === undefined || value === "" ? [] : [value];
+      });
+      return this.replyQuestionRequest(sessionId, pending.id, ordered);
+    }
+    const answer = {};
+    for (const question of pending.questions) {
+      answer[question.key] = answers.get(question.key);
+    }
+    return this.replyForm(sessionId, pending.id, answer);
+  }
+
+  // Rejects a pending batch: the tool call fails and the session continues.
+  async dismissPendingQuestions(sessionId, pending) {
+    return pending.protocol === "question"
+      ? this.rejectQuestionRequest(sessionId, pending.id)
+      : this.cancelForm(sessionId, pending.id);
+  }
+
   prompt(sessionId, text) {
     return this.request(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
       method: "POST",
@@ -1106,6 +1248,7 @@ class OpenCode2Driver extends ConnectorDriver {
       chat: true,
       models: true,
       permissions: true,
+      questions: true,
       drafts: true,
       tokens: true,
       cost: true,
@@ -1145,9 +1288,17 @@ class OpenCode2Driver extends ConnectorDriver {
       case "permission.asked":
         this.setLiveState(sessionId, "waiting");
         break;
+      case "form.created":
+      case "question.v2.asked":
+        this.setLiveState(sessionId, "question");
+        break;
       case "permission.replied":
-        // The agent loop resumes after a reply (approve continues the tool,
-        // reject fails it) — running until the execution result lands.
+      case "form.replied":
+      case "form.cancelled":
+      case "question.v2.replied":
+      case "question.v2.rejected":
+        // The agent loop resumes after a reply (answers continue the tool,
+        // rejection fails it) — running until the execution result lands.
         this.setLiveState(sessionId, "running");
         break;
       default:
@@ -1441,6 +1592,7 @@ class FileConnectorDriver extends ConnectorDriver {
       chat: false,
       models: false,
       permissions: false,
+      questions: false,
       drafts: false,
       tokens: this.supportsTokens(),
       cost: false,
@@ -2427,6 +2579,7 @@ class OpenCode1Driver extends ConnectorDriver {
       chat: false,
       models: false,
       permissions: false,
+      questions: false,
       drafts: false,
       tokens: true,
       cost: true,
@@ -3240,6 +3393,10 @@ class SessionChatView extends ItemView {
     this.loadSeq = 0;
     this.pendingPermission = null;
     this.replyingPermission = false;
+    this.pendingQuestion = null;
+    this.replyingQuestion = false;
+    // question key -> selected option value(s), custom text, boolean, number
+    this.questionAnswers = new Map();
     this.lastLoadedAt = 0;
     this.refreshing = false;
   }
@@ -3451,6 +3608,11 @@ class SessionChatView extends ItemView {
     this.permissionEl = contentEl.createDiv({ cls: "oc-permission" });
     this.permissionEl.style.display = "none";
 
+    // Agent question banner: same placement rationale — the session is
+    // paused until the batch is answered or dismissed.
+    this.questionEl = contentEl.createDiv({ cls: "oc-question" });
+    this.questionEl.style.display = "none";
+
     const composer = contentEl.createDiv({ cls: "oc-composer" });
     const caps = this.driverCapabilities();
     this.readOnly = !caps.chat;
@@ -3542,6 +3704,8 @@ class SessionChatView extends ItemView {
       this.hintEl.setText("Offline — input disabled");
     } else if (this.pendingPermission) {
       this.hintEl.setText("Waiting for your approval — the session is paused");
+    } else if (this.pendingQuestion) {
+      this.hintEl.setText("Waiting for your answer — the session is paused");
     } else if (this.isDraft()) {
       this.hintEl.setText("Draft — your first message will create the session");
     } else if (this.busy) {
@@ -3574,6 +3738,8 @@ class SessionChatView extends ItemView {
     let state;
     if (this.pendingPermission) {
       state = "waiting";
+    } else if (this.pendingQuestion) {
+      state = "question";
     } else if (this.busy) {
       state = "running";
     } else if (live) {
@@ -3658,6 +3824,7 @@ class SessionChatView extends ItemView {
       this.lastLoadedAt = Date.now();
       this.loadModels().catch(() => {});
       this.refreshPendingPermission().catch(() => {});
+      this.refreshPendingQuestion().catch(() => {});
     } catch (error) {
       if (this.unsubscribed || seq !== this.loadSeq) return;
       this.setOffline(true, error.message);
@@ -4170,6 +4337,22 @@ class SessionChatView extends ItemView {
         // Covers replies made anywhere (this banner, the TUI, elsewhere).
         this.clearPendingPermission(data?.requestID);
         break;
+      case "form.created":
+        // Servers with the form API surface the question tool as a form;
+        // newer servers emit question.v2.* events instead.
+        this.setPendingQuestion(this.driver?.client?.normalizeForms({ data: [data.form] })[0] || null);
+        break;
+      case "form.replied":
+      case "form.cancelled":
+        this.clearPendingQuestion(data?.id);
+        break;
+      case "question.v2.asked":
+        this.setPendingQuestion(this.driver?.client?.normalizeQuestionRequests({ data: [data] })[0] || null);
+        break;
+      case "question.v2.replied":
+      case "question.v2.rejected":
+        this.clearPendingQuestion(data?.requestID);
+        break;
       default:
         break;
     }
@@ -4275,6 +4458,264 @@ class SessionChatView extends ItemView {
       }
     } finally {
       this.replyingPermission = false;
+    }
+  }
+
+  // ----- question handling ----------------------------------------------------
+
+  setPendingQuestion(pending) {
+    if (!pending?.id || !this.sessionId) return;
+    if (pending.sessionID && pending.sessionID !== this.sessionId) return;
+    this.pendingQuestion = pending;
+    this.renderQuestionBanner();
+    this.renderBadge();
+    this.updateComposer();
+  }
+
+  clearPendingQuestion(questionId) {
+    if (!this.pendingQuestion) return;
+    if (questionId && this.pendingQuestion.id !== questionId) return;
+    this.pendingQuestion = null;
+    this.questionAnswers.clear();
+    this.questionOptionButtons = null;
+    this.questionCustomEls = null;
+    this.questionSubmitButton = null;
+    this.renderQuestionBanner();
+    this.renderBadge();
+    this.updateComposer();
+  }
+
+  // Recovers a pending question batch on view open / refresh (a session
+  // that was already waiting, or an answer made while reconnecting).
+  async refreshPendingQuestion() {
+    if (!this.sessionId || this.offline || !this.driver) return;
+    if (!this.driverCapabilities().questions) return;
+    try {
+      const pending = (await this.driver.client.pendingQuestions(this.sessionId))[0] || null;
+      if (this.unsubscribed) return;
+      if (pending) {
+        this.setPendingQuestion(pending);
+      } else if (this.pendingQuestion) {
+        this.clearPendingQuestion();
+      }
+    } catch {
+      // server hiccup — the event stream keeps us informed anyway
+    }
+  }
+
+  renderQuestionBanner() {
+    const banner = this.questionEl;
+    if (!banner) return;
+    banner.empty();
+    if (!this.pendingQuestion) {
+      banner.style.display = "none";
+      return;
+    }
+    const { title, questions } = this.pendingQuestion;
+    banner.style.display = "";
+    const head = banner.createDiv({ cls: "oc-question-head" });
+    setIcon(head.createSpan({ cls: "oc-question-icon" }), "help-circle");
+    head.createSpan({
+      cls: "oc-question-title",
+      text: title && title !== "Questions" ? `Agent asks — ${title}` : "Agent asks — answer to continue",
+    });
+    this.questionOptionButtons = new Map();
+    this.questionCustomEls = new Map();
+    for (const question of questions) {
+      this.renderQuestionField(banner, question);
+    }
+    const actions = banner.createDiv({ cls: "oc-question-actions" });
+    const dismiss = actions.createEl("button", { cls: "oc-question-dismiss", text: "Dismiss" });
+    dismiss.title = "Reject the questions — the tool call fails and the session continues";
+    dismiss.addEventListener("click", () => this.dismissQuestion());
+    this.questionSubmitButton = actions.createEl("button", {
+      cls: "oc-question-submit",
+      text: questions.length > 1 ? `Submit ${questions.length} answers` : "Submit answer",
+    });
+    this.questionSubmitButton.addEventListener("click", () => this.submitQuestion());
+    this.refreshQuestionSelections();
+    this.updateQuestionSubmitState();
+  }
+
+  renderQuestionField(banner, question) {
+    const field = banner.createDiv({ cls: "oc-question-field" });
+    field.createDiv({ cls: "oc-question-header", text: question.header });
+    if (question.question) {
+      field.createDiv({ cls: "oc-question-text", text: question.question });
+    }
+    if (question.external) {
+      field.createDiv({
+        cls: "oc-question-external",
+        text: "This input is answered from another surface; Dismiss cancels it here.",
+      });
+      return;
+    }
+    const answered = () => this.questionAnswers.get(question.key);
+    const setAnswer = (value) => {
+      this.questionAnswers.set(question.key, value);
+      this.refreshQuestionSelections();
+      this.updateQuestionSubmitState();
+    };
+    if (question.boolean) {
+      const row = field.createDiv({ cls: "oc-question-options" });
+      for (const value of [true, false]) {
+        const option = row.createEl("button", {
+          cls: "oc-question-option",
+          text: value ? "Yes" : "No",
+        });
+        this.trackQuestionOption(question.key, option, value);
+        option.addEventListener("click", () => setAnswer(value));
+      }
+      return;
+    }
+    const choices = Array.isArray(question.options) ? question.options : [];
+    if (choices.length) {
+      const row = field.createDiv({ cls: "oc-question-options" });
+      for (const choice of choices) {
+        const option = row.createEl("button", { cls: "oc-question-option" });
+        option.createSpan({ cls: "oc-question-option-label", text: choice.label });
+        if (choice.description) {
+          option.createSpan({ cls: "oc-question-option-desc", text: choice.description });
+        }
+        const value = choice.value ?? choice.label;
+        this.trackQuestionOption(question.key, option, value);
+        option.addEventListener("click", () => {
+          if (question.multiple) {
+            const current = new Set(Array.isArray(answered()) ? answered() : []);
+            if (current.has(value)) current.delete(value);
+            else current.add(value);
+            this.questionAnswers.set(question.key, [...current]);
+          } else {
+            this.questionAnswers.set(question.key, value);
+          }
+          const custom = this.questionCustomEls?.get(question.key);
+          if (custom) custom.value = "";
+          this.refreshQuestionSelections();
+          this.updateQuestionSubmitState();
+        });
+      }
+    }
+    if (!choices.length || question.custom !== false) {
+      const custom = field.createEl("input", {
+        type: "text",
+        cls: "oc-question-custom",
+        attr: {
+          placeholder: question.multiple
+            ? "Add your own answer (Enter to add)…"
+            : "Or type your own answer…",
+          spellcheck: "false",
+        },
+      });
+      const current = answered();
+      custom.value = Array.isArray(current) ? "" : typeof current === "string" ? current : "";
+      this.questionCustomEls.set(question.key, custom);
+      const applyCustom = () => {
+        const text = custom.value.trim();
+        if (!text) return;
+        if (question.multiple) {
+          const currentSet = new Set(Array.isArray(answered()) ? answered() : []);
+          currentSet.add(text);
+          this.questionAnswers.set(question.key, [...currentSet]);
+          custom.value = "";
+        } else {
+          this.questionAnswers.set(question.key, question.numeric ? Number(text) : text);
+        }
+        this.refreshQuestionSelections();
+        this.updateQuestionSubmitState();
+      };
+      custom.addEventListener("input", () => {
+        // Typing overrides a picked option for single-choice fields.
+        const text = custom.value.trim();
+        if (text && !question.multiple) {
+          this.questionAnswers.set(question.key, question.numeric ? Number(text) : text);
+          this.refreshQuestionSelections();
+          this.updateQuestionSubmitState();
+        }
+      });
+      custom.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+          event.preventDefault();
+          applyCustom();
+        }
+      });
+    }
+  }
+
+  trackQuestionOption(key, el, value) {
+    if (!this.questionOptionButtons) return;
+    let entries = this.questionOptionButtons.get(key);
+    if (!entries) {
+      entries = [];
+      this.questionOptionButtons.set(key, entries);
+    }
+    entries.push({ el, value });
+  }
+
+  // Toggles .is-selected in place — selection changes must not re-render
+  // the banner (that would steal focus from the custom-answer inputs).
+  refreshQuestionSelections() {
+    if (!this.questionOptionButtons) return;
+    for (const [key, entries] of this.questionOptionButtons) {
+      const value = this.questionAnswers.get(key);
+      const selected = Array.isArray(value) ? value : [value];
+      for (const entry of entries) {
+        entry.el.classList.toggle("is-selected", selected.includes(entry.value));
+      }
+    }
+  }
+
+  questionFieldAnswered(question) {
+    const value = this.questionAnswers.get(question.key);
+    if (question.boolean) return value === true || value === false;
+    if (Array.isArray(value)) return value.length > 0;
+    return value !== undefined && String(value).trim() !== "";
+  }
+
+  updateQuestionSubmitState() {
+    if (!this.questionSubmitButton || !this.pendingQuestion) return;
+    const complete = this.pendingQuestion.questions
+      .filter((question) => !question.external)
+      .every((question) => this.questionFieldAnswered(question));
+    this.questionSubmitButton.disabled = !complete;
+  }
+
+  async submitQuestion() {
+    const pending = this.pendingQuestion;
+    if (!pending || this.replyingQuestion) return;
+    this.replyingQuestion = true;
+    if (this.questionSubmitButton) this.questionSubmitButton.disabled = true;
+    try {
+      await this.driver.client.replyPendingQuestions(this.sessionId, pending, this.questionAnswers);
+      this.clearPendingQuestion(pending.id);
+      new Notice("Answer sent — the session continues");
+    } catch (error) {
+      // Answered or dismissed elsewhere (TUI, another tab): 404/409 — clear.
+      if (/^40[49]/.test(String(error.message))) {
+        this.clearPendingQuestion(pending.id);
+      } else {
+        new Notice(`Answer failed: ${error.message}`);
+      }
+    } finally {
+      this.replyingQuestion = false;
+    }
+  }
+
+  async dismissQuestion() {
+    const pending = this.pendingQuestion;
+    if (!pending || this.replyingQuestion) return;
+    this.replyingQuestion = true;
+    try {
+      await this.driver.client.dismissPendingQuestions(this.sessionId, pending);
+      this.clearPendingQuestion(pending.id);
+      new Notice("Questions dismissed — the tool call was rejected");
+    } catch (error) {
+      if (/^40[49]/.test(String(error.message))) {
+        this.clearPendingQuestion(pending.id);
+      } else {
+        new Notice(`Dismiss failed: ${error.message}`);
+      }
+    } finally {
+      this.replyingQuestion = false;
     }
   }
 
@@ -4440,6 +4881,7 @@ class SessionChatView extends ItemView {
       if (this.offline) this.setOffline(false);
       if (this.driverCapabilities().permissions) {
         this.refreshPendingPermission().catch(() => {});
+        this.refreshPendingQuestion().catch(() => {});
       }
     } catch {
       // ignore — the next event or manual refresh will retry
@@ -5353,7 +5795,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       driver.onServerDisposed();
       return;
     }
-    const sessionId = data.sessionID;
+    const sessionId = data.sessionID || (type === "form.created" ? data.form?.sessionID : undefined);
     driver.applyLiveEvent(type, sessionId);
     if (!sessionId) return;
     const listeners = this.sessionListeners.get(`${driver.connector.id}:${sessionId}`);
@@ -5826,6 +6268,12 @@ const LIST_REFRESH_EVENTS = new Set([
   "session.inbox.delivered",
   "permission.asked",
   "permission.replied",
+  "form.created",
+  "form.replied",
+  "form.cancelled",
+  "question.v2.asked",
+  "question.v2.replied",
+  "question.v2.rejected",
   "session.step.started",
   "session.step.ended",
   "session.deleted",

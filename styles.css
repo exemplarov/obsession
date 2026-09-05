@@ -78,6 +78,10 @@
   color: var(--color-orange);
 }
 
+.opencode-sessions-state-question {
+  color: var(--color-purple);
+}
+
 .opencode-sessions-state-error {
   color: var(--color-red);
 }
@@ -189,6 +193,11 @@
 .opencode-sessions-badge-interrupted {
   color: var(--color-orange);
   background: color-mix(in srgb, var(--color-orange) 12%, transparent);
+}
+
+.opencode-sessions-badge-question {
+  color: var(--color-purple);
+  background: color-mix(in srgb, var(--color-purple) 12%, transparent);
 }
 
 .opencode-sessions-badge-error {
@@ -697,6 +706,125 @@
 }
 
 .oc-permission-reject {
+  color: var(--color-red) !important;
+}
+
+/* Question banner (agent `question` tool) */
+.oc-question {
+  flex: 0 0 auto;
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--color-purple) 45%, var(--background-modifier-border));
+  border-left: 3px solid var(--color-purple);
+  border-radius: var(--radius-m);
+  background: color-mix(in srgb, var(--color-purple) 7%, var(--background-primary));
+}
+
+.oc-question-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-weight: var(--font-bold);
+  color: var(--color-purple);
+}
+
+.oc-question-icon {
+  display: inline-flex;
+  color: var(--color-purple);
+}
+
+.oc-question-field {
+  margin-top: 0.55rem;
+}
+
+.oc-question-header {
+  font-weight: var(--font-bold);
+  font-size: var(--font-smaller);
+}
+
+.oc-question-text {
+  font-size: var(--font-smaller);
+  color: var(--text-muted);
+  margin-top: 0.1rem;
+  overflow-wrap: anywhere;
+}
+
+.oc-question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.35rem;
+}
+
+.oc-question-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  text-align: left;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-primary);
+  cursor: pointer;
+}
+
+.oc-question-option:hover {
+  background: var(--background-modifier-hover);
+}
+
+.oc-question-option.is-selected {
+  border-color: var(--color-purple);
+  background: color-mix(in srgb, var(--color-purple) 12%, var(--background-primary));
+}
+
+.oc-question-option-label {
+  font-size: var(--font-smaller);
+  font-weight: var(--font-medium);
+}
+
+.oc-question-option.is-selected .oc-question-option-label::before {
+  content: "✓ ";
+  color: var(--color-purple);
+}
+
+.oc-question-option-desc {
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.oc-question-custom {
+  width: 100%;
+  margin-top: 0.35rem;
+  font-size: var(--font-smaller);
+}
+
+.oc-question-external {
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+  margin-top: 0.25rem;
+}
+
+.oc-question-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+.oc-question-actions button {
+  font-size: var(--font-smaller);
+}
+
+.oc-question-submit {
+  color: var(--color-purple) !important;
+}
+
+.oc-question-submit:disabled {
+  opacity: 0.5;
+}
+
+.oc-question-dismiss {
   color: var(--color-red) !important;
 }
 
