@@ -698,6 +698,9 @@ class OpenCodeClient {
   invalidate() {
     this.endpoint = null;
     this.endpointAt = 0;
+    // The form/question protocol is a property of the *server*; a repointed
+    // URL or an in-place server upgrade can flip it — re-probe after reset.
+    this.questionProtocol = undefined;
   }
 
   static async probe(baseUrl, password, timeoutMs = 2500) {
@@ -901,15 +904,24 @@ class OpenCodeClient {
     if (this.questionProtocol === "form") {
       return this.normalizeForms(await this.sessionForms(sessionId));
     }
+    if (this.questionProtocol === "unsupported") return [];
     try {
       const forms = await this.sessionForms(sessionId);
       this.questionProtocol = "form";
       return this.normalizeForms(forms);
     } catch (error) {
       if (!String(error.message).startsWith("404")) throw error;
-      const questions = await this.sessionQuestions(sessionId);
-      this.questionProtocol = "question";
-      return this.normalizeQuestionRequests(questions);
+      try {
+        const questions = await this.sessionQuestions(sessionId);
+        this.questionProtocol = "question";
+        return this.normalizeQuestionRequests(questions);
+      } catch (questionError) {
+        if (!String(questionError.message).startsWith("404")) throw questionError;
+        // Neither endpoint exists (older v2 build) — negative-cache instead
+        // of double-probing on every refresh.
+        this.questionProtocol = "unsupported";
+        return [];
+      }
     }
   }
 
@@ -974,7 +986,9 @@ class OpenCodeClient {
     }
     const answer = {};
     for (const question of pending.questions) {
-      answer[question.key] = answers.get(question.key);
+      // External fields are an acknowledgement (OAuth/integration flows):
+      // the server requires the literal `true` on reply — Submit grants it.
+      answer[question.key] = question.external ? true : answers.get(question.key);
     }
     return this.replyForm(sessionId, pending.id, answer);
   }
@@ -1286,6 +1300,7 @@ class OpenCode2Driver extends ConnectorDriver {
         this.setLiveState(sessionId, "error");
         break;
       case "permission.asked":
+      case "permission.v2.asked": // next-gen servers renamed the event
         this.setLiveState(sessionId, "waiting");
         break;
       case "form.created":
@@ -1293,6 +1308,7 @@ class OpenCode2Driver extends ConnectorDriver {
         this.setLiveState(sessionId, "question");
         break;
       case "permission.replied":
+      case "permission.v2.replied":
       case "form.replied":
       case "form.cancelled":
       case "question.v2.replied":
@@ -1309,6 +1325,17 @@ class OpenCode2Driver extends ConnectorDriver {
   setLiveState(sessionId, status) {
     if (!sessionId) return;
     this.liveStates.set(sessionId, { status, at: Date.now() });
+  }
+
+  // A poll proved this status is gone (e.g. the question was answered from
+  // another surface while the event stream was down) — demote it to idle so
+  // dashboards and badges don't read "Needs answer"/"Needs approval" forever.
+  clearLiveStatus(sessionId, status) {
+    if (!sessionId) return;
+    const state = this.liveStates.get(sessionId);
+    if (!state || state.status !== status) return;
+    this.liveStates.set(sessionId, { status: "idle", at: Date.now() });
+    this.plugin.emitChange();
   }
 
   async syncActiveSessions() {
@@ -1892,7 +1919,9 @@ class ClaudeCodeDriver extends FileConnectorDriver {
       if (line.type === "user" || line.type === "assistant") lastType = line.type;
     };
     eachJsonLine(head, visitHead);
-    eachJsonLine(tail, visitTail);
+    // Small files (≤ headBytes) return an empty tail — the head IS the whole
+    // file then, so scan it for title/model/lastType too (Cursor-style).
+    eachJsonLine(tail || head, visitTail);
     return {
       title,
       model,
@@ -2112,7 +2141,17 @@ class CodexDriver extends FileConnectorDriver {
     const zstdPath = resolveZstdExecutable(this.config.zstdPath);
     const text = await runExternal(zstdPath, ["-dc", entry.file]);
     const stat = fs.statSync(entry.file);
-    if (!headBytes && !tailBytes) return { text, stat };
+    if (!headBytes && !tailBytes) {
+      // The pre-parse stat.size check sees the COMPRESSED size; the cap
+      // applies to what lands in the renderer heap — re-check decompressed.
+      const bytes = Buffer.byteLength(text);
+      if (bytes > FileConnectorDriver.MAX_PARSE_BYTES) {
+        throw new Error(
+          `Session transcript is ${Math.round(bytes / 1024 / 1024)} MB decompressed — too large to display (limit ${Math.round(FileConnectorDriver.MAX_PARSE_BYTES / 1024 / 1024)} MB).`,
+        );
+      }
+      return { text, stat };
+    }
     const size = text.length;
     return {
       head: text.slice(0, headBytes || 64 * 1024),
@@ -2154,7 +2193,7 @@ class CodexDriver extends FileConnectorDriver {
       }
       if (line.type === "turn_context" && line.payload?.model) model = line.payload.model;
     });
-    eachJsonLine(tail, (line) => {
+    eachJsonLine(tail || head, (line) => {
       const ts = epochMs(line.timestamp);
       if (ts) lastTime = ts;
       if (line.type === "turn_context" && line.payload?.model) model = line.payload.model;
@@ -3087,10 +3126,13 @@ class SessionsDashboard {
       });
       const refreshButton = toolbar.createEl("button", { text: "Refresh" });
       refreshButton.addEventListener("click", () => this.load());
-      // New sessions need a drafts-capable connector (OpenCode v2).
+      // New sessions need a drafts-capable connector (OpenCode v2) — the
+      // dashboard's own connector, not whatever is globally default.
       let draftsCapable = false;
       try {
-        draftsCapable = !!this.plugin.driverForOptions({})?.capabilities().drafts;
+        draftsCapable = !!this.plugin
+          .driverForOptions({ connector: this.requestedConnectorName || undefined })
+          ?.capabilities().drafts;
       } catch {
         draftsCapable = false;
       }
@@ -4331,9 +4373,11 @@ class SessionChatView extends ItemView {
         this.finalizeStep(data);
         break;
       case "permission.asked":
+      case "permission.v2.asked": // next-gen servers renamed the event
         this.setPendingPermission(data);
         break;
       case "permission.replied":
+      case "permission.v2.replied":
         // Covers replies made anywhere (this banner, the TUI, elsewhere).
         this.clearPendingPermission(data?.requestID);
         break;
@@ -4466,6 +4510,9 @@ class SessionChatView extends ItemView {
   setPendingQuestion(pending) {
     if (!pending?.id || !this.sessionId) return;
     if (pending.sessionID && pending.sessionID !== this.sessionId) return;
+    // Same batch already rendered: re-rendering would steal focus from the
+    // custom-answer inputs and wipe typed-but-unapplied multi-select text.
+    if (this.pendingQuestion?.id === pending.id) return;
     this.pendingQuestion = pending;
     this.renderQuestionBanner();
     this.renderBadge();
@@ -4480,6 +4527,9 @@ class SessionChatView extends ItemView {
     this.questionOptionButtons = null;
     this.questionCustomEls = null;
     this.questionSubmitButton = null;
+    // The batch is gone — a stale driver-side "question" state (answer made
+    // elsewhere while the event stream was down) must not outlive it.
+    this.driver?.clearLiveStatus?.(this.sessionId, "question");
     this.renderQuestionBanner();
     this.renderBadge();
     this.updateComposer();
@@ -4546,7 +4596,7 @@ class SessionChatView extends ItemView {
     if (question.external) {
       field.createDiv({
         cls: "oc-question-external",
-        text: "This input is answered from another surface; Dismiss cancels it here.",
+        text: "This input is answered from another surface; Submit acknowledges it here, Dismiss cancels.",
       });
       return;
     }
@@ -4618,7 +4668,7 @@ class SessionChatView extends ItemView {
           this.questionAnswers.set(question.key, [...currentSet]);
           custom.value = "";
         } else {
-          this.questionAnswers.set(question.key, question.numeric ? Number(text) : text);
+          this.setCustomAnswer(question, text);
         }
         this.refreshQuestionSelections();
         this.updateQuestionSubmitState();
@@ -4627,7 +4677,7 @@ class SessionChatView extends ItemView {
         // Typing overrides a picked option for single-choice fields.
         const text = custom.value.trim();
         if (text && !question.multiple) {
-          this.questionAnswers.set(question.key, question.numeric ? Number(text) : text);
+          this.setCustomAnswer(question, text);
           this.refreshQuestionSelections();
           this.updateQuestionSubmitState();
         }
@@ -4649,6 +4699,18 @@ class SessionChatView extends ItemView {
       this.questionOptionButtons.set(key, entries);
     }
     entries.push({ el, value });
+  }
+
+  // Free-text answers: numeric fields only accept finite numbers — anything
+  // else leaves the field unanswered (Submit stays disabled) instead of
+  // serializing NaN → null into the reply.
+  setCustomAnswer(question, text) {
+    if (!question.numeric) {
+      this.questionAnswers.set(question.key, text);
+      return;
+    }
+    const numeric = Number(text);
+    this.questionAnswers.set(question.key, Number.isFinite(numeric) ? numeric : undefined);
   }
 
   // Toggles .is-selected in place — selection changes must not re-render
@@ -4697,6 +4759,9 @@ class SessionChatView extends ItemView {
       }
     } finally {
       this.replyingQuestion = false;
+      // Re-enable Submit for a retry — a transient failure must not leave
+      // the banner permanently unanswerable while the session is paused.
+      this.updateQuestionSubmitState();
     }
   }
 
@@ -5023,7 +5088,9 @@ class NewSessionView extends ItemView {
     super(leaf);
     this.plugin = plugin;
     this.directories = plugin.pendingPickerDirectories || null;
+    this.connectorId = plugin.pendingPickerConnectorId || null;
     plugin.pendingPickerDirectories = null;
+    plugin.pendingPickerConnectorId = null;
   }
 
   getViewType() {
@@ -5038,8 +5105,9 @@ class NewSessionView extends ItemView {
     return "plus";
   }
 
-  setDirectories(directories) {
+  setDirectories(directories, connectorId = null) {
     this.directories = directories;
+    this.connectorId = connectorId;
     if (this.contentEl) this.render();
   }
 
@@ -5062,7 +5130,7 @@ class NewSessionView extends ItemView {
     const cards = contentEl.createDiv({ cls: "opencode-sessions-cards" });
     for (const directory of this.directories) {
       const card = cards.createDiv({ cls: "opencode-sessions-card" });
-      card.addEventListener("click", () => this.plugin.openSessionDraft(directory));
+      card.addEventListener("click", () => this.plugin.openSessionDraft(directory, this.connectorId));
       const head = card.createDiv({ cls: "opencode-sessions-card-head" });
       const titleWrap = head.createSpan({ cls: "oc-picker-title" });
       setIcon(titleWrap.createSpan({ cls: "oc-picker-icon" }), "folder");
@@ -6043,51 +6111,54 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
   }
 
   // New-session flow: single configured directory goes straight to a draft
-  // chat; several open the directory picker.
+  // chat; several open the directory picker. The `connector` option is
+  // authoritative end-to-end — directories come from ITS config and the
+  // draft is pinned to IT, never silently to the default connector.
   async newSession(options = {}) {
-    const driver = this.driverForOptions(options);
+    const entry = this.connectorForOptions(options);
     let draftsCapable = false;
     try {
-      draftsCapable = !!driver?.capabilities().drafts;
+      draftsCapable = !!entry?.driver?.capabilities().drafts;
     } catch {
       draftsCapable = false;
     }
-    if (!draftsCapable) {
+    if (!draftsCapable || !entry) {
       new Notice("New sessions need an OpenCode v2 connector — set one as the default connector in settings.");
       return;
     }
-    const { directories } = this.resolveDirectories(options);
+    const { directories } = this.resolveDirectories(options, entry.connector);
     if (!directories.length) {
       new Notice("No directories configured — add them in OpenCode Sessions settings.");
       return;
     }
     if (directories.length === 1) {
-      await this.openSessionDraft(directories[0]);
+      await this.openSessionDraft(directories[0], entry.connector.id);
       return;
     }
-    await this.activateNewSessionPicker(directories);
+    await this.activateNewSessionPicker(directories, entry.connector.id);
   }
 
-  async openSessionDraft(directory) {
-    const connectorId = this.registry.defaultConnector()?.connector.id || null;
+  async openSessionDraft(directory, connectorId = null) {
+    const resolvedConnectorId = connectorId || this.registry.defaultConnector()?.connector.id || null;
     this.pendingDraftDirectory = directory;
-    this.pendingSessionRef = { connectorId, sessionId: null };
+    this.pendingSessionRef = { connectorId: resolvedConnectorId, sessionId: null };
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({
       type: VIEW_TYPE_SESSION,
       active: true,
-      state: { draftDirectory: directory, connectorId },
+      state: { draftDirectory: directory, connectorId: resolvedConnectorId },
     });
     this.app.workspace.revealLeaf(leaf);
     return leaf;
   }
 
-  async activateNewSessionPicker(directories) {
+  async activateNewSessionPicker(directories, connectorId = null) {
     let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_NEW_SESSION)[0];
     if (leaf && leaf.view instanceof NewSessionView) {
-      leaf.view.setDirectories(directories);
+      leaf.view.setDirectories(directories, connectorId);
     } else {
       this.pendingPickerDirectories = directories;
+      this.pendingPickerConnectorId = connectorId;
       leaf = this.app.workspace.getLeaf("tab");
       await leaf.setViewState({ type: VIEW_TYPE_NEW_SESSION, active: true });
     }
@@ -6160,6 +6231,16 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       return this.registry.byName(name.trim())?.driver || null;
     }
     return this.registry.defaultConnector()?.driver || null;
+  }
+
+  // Registry entry for an options.connector name (or the default) — callers
+  // that need the connector's config/id resolve it once and reuse it.
+  connectorForOptions(options = {}) {
+    const name = options.connector;
+    if (typeof name === "string" && name.trim()) {
+      return this.registry.byName(name.trim()) || null;
+    }
+    return this.registry.defaultConnector() || null;
   }
 
   // Normalizes directory options shared by listing and new-session picking.
@@ -6268,6 +6349,8 @@ const LIST_REFRESH_EVENTS = new Set([
   "session.inbox.delivered",
   "permission.asked",
   "permission.replied",
+  "permission.v2.asked",
+  "permission.v2.replied",
   "form.created",
   "form.replied",
   "form.cancelled",

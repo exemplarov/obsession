@@ -59,12 +59,13 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 
 - **Note-embedded dashboards** via an `opencode-sessions` code block (cards or table layout) — no other plugins required.
 - **Dedicated view** (command palette: *Open OpenCode sessions*, or the ribbon icon).
-- **Live state tracking** from the v2 event stream (`GET /api/event`): Running…, Idle, Needs approval, Interrupted, Error — updated the instant they change. Falls back to SQLite heuristics when the server is unreachable.
+- **Live state tracking** from the v2 event stream (`GET /api/event`): Running…, Idle, Needs approval, Needs answer, Interrupted, Error — updated the instant they change. Falls back to SQLite heuristics when the server is unreachable.
 - **Session chat view**: messages stream in live (text + reasoning + tool calls with input/output); history loads the newest page first and pages in older messages as you scroll to the top. Works for every connector (read-only ones simply don't stream).
 - **Prompt & stop**: send messages to a session and interrupt a running one right from the composer (OpenCode v2 connectors).
 - **New sessions**: the *New OpenCode session* command picks one of your configured directories and starts a draft chat; the server session is created with your first message.
 - **Model selector**: defaults match OpenCode exactly — the last-used model *and* its persisted variant, falling back to the server's location-aware default; existing sessions switch live.
 - **Approvals**: permission banners with Allow / Always allow / Reject, synced with replies made anywhere (TUI, other tabs).
+- **Agent questions**: answer the agent's `question` tool inline — options (single/multi-select), yes/no, or custom text — or dismiss it; synced with answers made anywhere. Works across both server generations (form and question APIs).
 - **Offline fallback**: when the server is down, v2 chats show the conversation read-only from `session_v2`/`session_message`.
 - Also exposes an API (`globalThis.opencodeSessions`) for e.g. Datacore JSX consumers.
 
