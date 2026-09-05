@@ -296,6 +296,26 @@ function decodeEncodedDir(encoded, configuredDirs = []) {
   return decoded;
 }
 
+// Encoded dirs (Claude/Cursor) match filter entries by slug — the encoded
+// form is lossless, unlike decoded paths where "forty-two" naively decodes
+// to "forty/two". Real-cwd backends (Codex) match by path.
+function directoryMatchesFilter(entry, wantedPaths, wantedSlugs) {
+  if (!wantedPaths.size) return true;
+  if (entry.encodedDir) return wantedSlugs.has(entry.encodedDir);
+  return wantedPaths.has(path.normalize(entry.directory || ""));
+}
+
+// Best display directory: the exact configured path whose slug matches the
+// encoded dir, else the decoded fallback.
+function displayDirectoryFor(entry, wantedPaths) {
+  if (entry.encodedDir) {
+    for (const wanted of wantedPaths) {
+      if (slugifyPath(wanted) === entry.encodedDir) return wanted;
+    }
+  }
+  return entry.directory;
+}
+
 // Reads the first `headBytes` and last `tailBytes` of a file without loading
 // the middle — listing scans stay fast even on multi-MB transcripts.
 function readHeadTail(filePath, headBytes = 64 * 1024, tailBytes = 256 * 1024) {
@@ -1480,11 +1500,12 @@ class FileConnectorDriver extends ConnectorDriver {
     const { basedir, directories } = this.plugin.resolveDirectories(options, this.connector);
     // Block-level `dirs` act as an additional exact-match filter (parity
     // with opencode listing); connector-configured directories do the same.
-    const wanted = new Set(
+    const wantedPaths = new Set(
       [...(directories.length ? directories : []), ...(this.directoryFilter() || [])].map((d) =>
         path.normalize(d),
       ),
     );
+    const wantedSlugs = new Set([...wantedPaths].map((directory) => slugifyPath(directory)));
     const entries = await this.enumerateSessions();
     const rows = [];
     for (const entry of entries) {
@@ -1497,8 +1518,8 @@ class FileConnectorDriver extends ConnectorDriver {
       if (!fields) continue;
       // Filter AFTER scanning: codex resolves its directory from
       // session_meta during the scan.
-      const resolvedDirectory = fields.directory || entry.directory;
-      if (wanted.size && !wanted.has(path.normalize(resolvedDirectory || ""))) continue;
+      if (!directoryMatchesFilter(entry, wantedPaths, wantedSlugs)) continue;
+      const resolvedDirectory = displayDirectoryFor(entry, wantedPaths) || fields.directory || entry.directory;
       this.sessionStates.set(entry.id, fields.state || "idle");
       rows.push(
         this.decoratedRow(
@@ -1678,6 +1699,7 @@ class ClaudeCodeDriver extends FileConnectorDriver {
         entries.push({
           id: file.replace(/\.jsonl$/, ""),
           file: path.join(root, slug, file),
+          encodedDir: slug,
           directory: decodeEncodedDir(slug, configured),
         });
       }
@@ -2219,6 +2241,7 @@ class CursorDriver extends FileConnectorDriver {
         entries.push({
           id: sessionId,
           file,
+          encodedDir: encoded,
           directory: decodeEncodedDir(encoded, configured),
         });
       }
