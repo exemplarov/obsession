@@ -85,7 +85,7 @@ client-side by directory instead).
         "useDatabase": true,
         "databasePath": "~/.local/share/opencode/opencode.db",
         "sqlitePath": "sqlite3",
-        "directories": ["/Users/roman/vaults/myvault"],
+        "directories": ["~/vaults/myvault"],
         "customSql": ""
       }
     }

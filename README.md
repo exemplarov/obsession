@@ -1,6 +1,7 @@
-# OpenCode Sessions (Obsidian plugin)
+# Obsession (Obsidian plugin)
 
-Browse your [OpenCode](https://opencode.ai) **v2** sessions directly in
+**Ob**sidian **session** browser — hence *Obsession*. Browse your
+[OpenCode](https://opencode.ai) **v2** sessions directly in
 [Obsidian](https://obsidian.md) — as a dedicated view or as dashboards embedded
 in any note — then open any session and watch it **stream in real time**, send
 follow-up prompts, and interrupt runs.
@@ -75,9 +76,9 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 ```opencode-sessions
 connector: claude
 layout: cards
-basedir: /Users/roman/
+basedir: ~/
 dirs:
-  - vaults/my-vault
+  - projects/my-project
 ```
 ````
 
@@ -124,12 +125,28 @@ health status, duplicate/delete, and per-kind fields:
 - *Claude Code / Cursor*: projects root, directories filter.
 - *Codex*: sessions root, zstd executable, directories filter.
 
+## Privacy & data access
+
+Obsession runs entirely on your machine and contains **no telemetry**. For
+transparency, it does access:
+
+- **Files outside your vaults** (read-only): OpenCode v2/v1
+  `~/.local/share/opencode/opencode.db`, Claude Code `~/.claude/projects/`,
+  Codex `~/.codex/sessions/`, Cursor `~/.cursor/projects/` — that's where the
+  agent histories live. Nothing outside your vault is modified.
+- **Local network**: the auto-discovered OpenCode v2 server
+  (`~/.local/state/opencode/service.json`) for live streaming, chat, prompts,
+  and approvals. With a remote *Server URL override*, the plugin talks to that
+  host only — and nothing else.
+- **Helper binaries**: the system `sqlite3` binary (path configurable) and an
+  optional `zstd` for Codex transcripts are spawned locally, detached.
+
 ## Install (manual)
 
 Copy `main.js`, `manifest.json`, and `styles.css` into
-`<vault>/.obsidian/plugins/opencode-sessions/`, then enable **OpenCode
-Sessions** under Settings → Community plugins. Desktop only (spawns
-`sqlite3`/`zstd`, talks to local servers).
+`<vault>/.obsidian/plugins/obsession/`, then enable **Obsession** under
+Settings → Community plugins. Desktop only (spawns `sqlite3`/`zstd`, talks to
+local servers).
 
 ## API
 
@@ -171,6 +188,11 @@ suggests an open turn (Claude: last line is the user prompt; Codex: last
 event is `task_started`; Cursor: last line is an assistant message without
 `turn_ended`) reads as Running within the same 15-minute window; otherwise
 Idle. OpenCode v1 uses the message-table variant of the v2 fallback.
+
+## Contact
+
+- Telegram: [@romanexe](https://t.me/romanexe) · [@romanexeru](https://t.me/romanexeru)
+- X: [@exemplarov](https://x.com/exemplarov)
 
 ## Development
 
