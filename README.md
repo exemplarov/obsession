@@ -67,6 +67,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Prompt & stop**: send messages to a session and interrupt a running one right from the composer (OpenCode v2 connectors).
 - **New sessions**: the *New OpenCode session* command picks one of your configured directories and starts a draft chat; the server session is created with your first message.
 - **Model selector**: defaults match OpenCode exactly — the last-used model *and* its persisted variant, falling back to the server's location-aware default; existing sessions switch live.
+- **Agent selector**: pick the session's agent (e.g. `build`, `plan`, custom agents) next to the model selector; hidden and subagent-only entries are filtered out, descriptions show on hover, and existing sessions switch live (drafts apply the choice at creation).
 - **Approvals**: permission banners with Allow / Always allow / Reject, synced with replies made anywhere (TUI, other tabs).
 - **Agent questions**: answer the agent's `question` tool inline — options (single/multi-select), yes/no, or custom text — or dismiss it; synced with answers made anywhere. Works across both server generations (form and question APIs).
 - **Offline fallback**: when the server is down, v2 chats show the conversation read-only from `session_v2`/`session_message`.

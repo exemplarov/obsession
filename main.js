@@ -837,6 +837,17 @@ class OpenCodeClient {
     });
   }
 
+  agents(directory) {
+    return this.request(`/api/agent${this.locationQuery(directory)}`);
+  }
+
+  setSessionAgent(sessionId, agent) {
+    return this.request(`/api/session/${encodeURIComponent(sessionId)}/agent`, {
+      method: "POST",
+      body: { agent },
+    });
+  }
+
   sessionPermissions(sessionId) {
     return this.request(`/api/session/${encodeURIComponent(sessionId)}/permission`);
   }
@@ -1261,6 +1272,7 @@ class OpenCode2Driver extends ConnectorDriver {
       pagination: true,
       chat: true,
       models: true,
+      agents: true,
       permissions: true,
       questions: true,
       drafts: true,
@@ -1618,6 +1630,7 @@ class FileConnectorDriver extends ConnectorDriver {
       pagination: true, // in-memory (synthetic offset cursors)
       chat: false,
       models: false,
+      agents: false,
       permissions: false,
       questions: false,
       drafts: false,
@@ -2617,6 +2630,7 @@ class OpenCode1Driver extends ConnectorDriver {
       pagination: true, // in-memory over the session's merged messages
       chat: false,
       models: false,
+      agents: false,
       permissions: false,
       questions: false,
       drafts: false,
@@ -3561,6 +3575,7 @@ class SessionChatView extends ItemView {
       this.renderBadge();
       this.updateComposer();
       this.loadModels().catch(() => {});
+      this.loadAgents().catch(() => {});
       return;
     }
     this.contentEl.createDiv({ cls: "opencode-session-empty", text: "No session selected." });
@@ -3669,6 +3684,8 @@ class SessionChatView extends ItemView {
       this.inputEl.style.display = "none";
       this.inputEl.disabled = true;
       const actions = composer.createDiv({ cls: "oc-composer-actions" });
+      this.agentSelect = actions.createEl("select", { cls: "oc-agent-select" });
+      this.agentSelect.style.display = "none";
       this.modelSelect = actions.createEl("select", { cls: "oc-model-select" });
       this.modelSelect.style.display = "none";
       this.hintEl = actions.createSpan({ cls: "oc-hint", text: "" });
@@ -3691,6 +3708,9 @@ class SessionChatView extends ItemView {
     });
     this.inputEl.addEventListener("input", () => this.autoGrow());
     const actions = composer.createDiv({ cls: "oc-composer-actions" });
+    this.agentSelect = actions.createEl("select", { cls: "oc-agent-select" });
+    this.agentSelect.title = "Agent";
+    this.agentSelect.addEventListener("change", () => this.onAgentChange());
     this.modelSelect = actions.createEl("select", { cls: "oc-model-select" });
     this.modelSelect.title = "Model";
     this.modelSelect.addEventListener("change", () => this.onModelChange());
@@ -3865,6 +3885,7 @@ class SessionChatView extends ItemView {
       this.renderBadge();
       this.lastLoadedAt = Date.now();
       this.loadModels().catch(() => {});
+      this.loadAgents().catch(() => {});
       this.refreshPendingPermission().catch(() => {});
       this.refreshPendingQuestion().catch(() => {});
     } catch (error) {
@@ -4009,6 +4030,102 @@ class SessionChatView extends ItemView {
     } catch (error) {
       new Notice(`Could not switch model: ${error.message}`);
       this.selectModelRef(current || null, null);
+    }
+  }
+
+  // ----- agent selector ------------------------------------------------------
+
+  selectedAgentId() {
+    const value = this.agentSelect?.value || "";
+    // The empty value is the Default entry — it lets the server resolve its
+    // own default agent (default_agent config → build), like OpenCode itself.
+    return value || null;
+  }
+
+  // Populates the agent dropdown: a Default entry resolved by the server at
+  // prompt time, then every chatty agent for this location. Hidden and
+  // subagent-only entries are skipped — they are internal machinery
+  // (compaction/title/summary) or invoked via the task tool, not runnable as
+  // the session agent.
+  async loadAgents() {
+    if (!this.agentSelect || !this.driverCapabilities().agents) return;
+    const directory = this.session?.location?.directory || this.draftDirectory;
+    let agents = [];
+    try {
+      const response = await this.driver.client.agents(directory);
+      agents = Array.isArray(response?.data) ? response.data : [];
+    } catch {
+      this.agentSelect.style.display = "none";
+      return;
+    }
+    if (this.unsubscribed) return;
+    const select = this.agentSelect;
+    select.empty();
+
+    const defaultOption = select.createEl("option", { value: "", text: "Default agent" });
+    defaultOption.dataset.isDefault = "1";
+
+    for (const agent of agents) {
+      if (!agent?.id || agent.hidden || agent.mode === "subagent") continue;
+      const option = select.createEl("option", {
+        value: agent.id,
+        text: agent.name || agent.id,
+      });
+      if (agent.description) option.title = agent.description;
+    }
+
+    // Reflect the session's current agent (existing sessions), else keep the
+    // Default entry selected so drafts match the server's default agent.
+    const current = this.session?.agent || "";
+    if (current) this.selectAgentId(current);
+    else select.value = defaultOption.value;
+    select.style.display = "";
+  }
+
+  selectAgentId(agentId) {
+    const select = this.agentSelect;
+    if (!select || !agentId) return;
+    let match = null;
+    for (const option of select.options) {
+      if (option.value === agentId) {
+        match = option;
+        break;
+      }
+    }
+    if (!match) {
+      // Agent no longer registered (config changed) — keep it selectable.
+      match = select.createEl("option", { value: agentId, text: agentId });
+    }
+    select.value = match.value;
+  }
+
+  async onAgentChange() {
+    if (this.isDraft()) return; // stored in the select; applied at creation
+    const agentId = this.selectedAgentId();
+    if (!agentId || !this.sessionId) return;
+    if (this.session?.agent === agentId) return;
+    const label = this.agentSelect.selectedOptions[0]?.textContent || agentId;
+    try {
+      await this.driver.client.setSessionAgent(this.sessionId, agentId);
+    } catch (error) {
+      new Notice(`Could not switch agent: ${error.message}`);
+      this.selectAgentId(this.session?.agent || "");
+      return;
+    }
+    this.session = { ...this.session, agent: agentId };
+    this.renderHeader();
+    new Notice(`Agent switched to ${label}`);
+    // Agents carry their own default model; the server may have swapped it
+    // — re-sync the session so the model selector stays truthful.
+    try {
+      const session = await this.driver.getSession(this.sessionId);
+      if (!this.unsubscribed && session) {
+        this.session = session;
+        this.renderHeader();
+        if (session.model) this.selectModelRef(session.model, null);
+      }
+    } catch {
+      // switching worked; the resync is best-effort
     }
   }
 
@@ -5039,6 +5156,7 @@ class SessionChatView extends ItemView {
         body: {
           location: { directory: this.draftDirectory },
           model: this.selectedModelRef() || undefined,
+          agent: this.selectedAgentId() || undefined,
         },
       });
       const session = created?.data;
@@ -5048,6 +5166,8 @@ class SessionChatView extends ItemView {
       this.bindSession(session.id);
       this.renderHeader();
       this.renderBadge();
+      // The server resolved the default agent at creation — show it.
+      this.selectAgentId(session.agent || "");
       this.inputEl.value = "";
       this.autoGrow();
       const response = await this.driver.client.prompt(session.id, text);

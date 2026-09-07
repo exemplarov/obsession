@@ -403,9 +403,12 @@ api.config()                        // v3 fields + { connectors: [...], defaultC
   cost, tokens, time{created,updated,…}, location.directory`),
   `GET /api/session/active`, `GET /api/session/:id`,
   `GET /api/session/:id/message?limit&order&cursor` (`{data, cursor.next}`),
-  `POST /api/session/:id/prompt|interrupt|model`,
+  `POST /api/session/:id/prompt|interrupt|model|agent`,
   `GET/POST /api/session/:id/permission[/:requestId/reply]`,
-  `GET /api/model[/default]?location[directory]=…`, SSE `GET /api/event`.
+  `GET /api/model[/default]?location[directory]=…`,
+  `GET /api/agent?location[directory]=…` (chat-capable agents for a
+  location; `hidden` and `mode=subagent` entries are filtered client-side),
+  SSE `GET /api/event`.
 
 ### 10.2 OpenCode v1 (local, same DB file)
 
