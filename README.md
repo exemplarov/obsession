@@ -58,7 +58,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 
 ## Features
 
-- **Note-embedded dashboards** via an `opencode-sessions` code block (cards or table layout) — no other plugins required.
+- **Note-embedded dashboards** via an `obsession` code block (cards or table layout) — no other plugins required.
 - **Dedicated view** (command palette: *Open OpenCode sessions*, or the ribbon icon).
 - **Live state tracking** from the v2 event stream (`GET /api/event`): Running…, Idle, Needs approval, Needs answer, Interrupted, Error — updated the instant they change. Falls back to SQLite heuristics when the server is unreachable.
 - **Session chat view**: messages stream in live (text + reasoning + tool calls with input/output); history loads the newest page first and pages in older messages as you scroll to the top. Works for every connector (read-only ones simply don't stream).
@@ -68,12 +68,12 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Approvals**: permission banners with Allow / Always allow / Reject, synced with replies made anywhere (TUI, other tabs).
 - **Agent questions**: answer the agent's `question` tool inline — options (single/multi-select), yes/no, or custom text — or dismiss it; synced with answers made anywhere. Works across both server generations (form and question APIs).
 - **Offline fallback**: when the server is down, v2 chats show the conversation read-only from `session_v2`/`session_message`.
-- Also exposes an API (`globalThis.opencodeSessions`) for e.g. Datacore JSX consumers.
+- Also exposes an API (`globalThis.obsession`) for e.g. Datacore JSX consumers.
 
 ## Embed in a note
 
 ````markdown
-```opencode-sessions
+```obsession
 connector: claude
 layout: cards
 basedir: ~/
@@ -101,10 +101,11 @@ Click a card (or table row) to open the live chat view; click a session ID to co
 Markdown links open the chat tab for a session:
 
 ```markdown
-[Yesterday's refactor](opencode-session://open?sessionId=ses_abc123)
-[A claude session](opencode-session://open?connector=claude&sessionId=<uuid>)
+[Yesterday's refactor](obsidian://obsession?sessionId=ses_abc123)
+[A claude session](obsidian://obsession?connector=claude&sessionId=<uuid>)
 ```
 
+Pre-rename `obsidian://opencode-session?…` links keep working.
 `opencode-v1:<id>`-style prefixed ids also work in *Open session by ID*
 (and in `api.open("claude:<uuid>")`). Bare ids resolve against the default
 connector.
@@ -150,10 +151,11 @@ local servers).
 
 ## API
 
-`globalThis.opencodeSessions` (version 4):
+`globalThis.obsession` (version 4; the pre-rename `globalThis.opencodeSessions`
+alias points to the same object):
 
 ```js
-const api = globalThis.opencodeSessions;
+const api = globalThis.obsession;
 api.connectors();                    // [{ id, name, kind, enabled, capabilities }]
 api.defaultConnector();              // name of the default connector
 const claude = api.connector("claude");

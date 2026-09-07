@@ -2,7 +2,7 @@
 
 Status: proposed
 Date: 2026-09-04
-Applies to: opencode-sessions ≥ 0.8.0
+Applies to: Obsession (formerly opencode-sessions) ≥ 0.8.0
 
 ## 1. Goal
 
@@ -115,7 +115,7 @@ On load, if `saved.connectors` is absent:
 2. `defaultConnectorId` = that connector's id.
 3. `pageSize`, `refreshSeconds` carry over; legacy flat keys are dropped after
    the first `saveData`.
-4. Existing `data.json` consumers (`globalThis.opencodeSessions.config()`)
+4. Existing `data.json` consumers (`globalThis.obsession.config()`)
    keep working — see §8.
 
 Migration is transparent: a user upgrading sees identical behavior.
@@ -216,7 +216,7 @@ expressed as `name:sessionId` (e.g. `claude:4108410a-7f35-…`). Names are
 unique and `:`-free, making this unambiguous and human-readable.
 
 - Widget: `connector: claude` (by name) + ids stay plain.
-- Links: `opencode-session://open?connector=claude&sessionId=<id>`; the
+- Links: `obsidian://obsession?connector=claude&sessionId=<id>`; the
   legacy `?sessionId=` form resolves against the default connector.
 - `plugin.openSession(ref)` accepts either the pair or a `"name:id"` string.
 
@@ -359,7 +359,7 @@ appendix §10 has the raw formats):
   sessions are treated as historical (idle) unless the last assistant
   message is incomplete within the freshness window.
 
-## 8. Public API (`globalThis.opencodeSessions`)
+## 8. Public API (`globalThis.obsession`)
 
 Version 4, additive; v3 shapes keep working when only the default connector
 is involved:
