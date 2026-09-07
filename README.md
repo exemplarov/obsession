@@ -1,6 +1,6 @@
 # Obsession (Obsidian plugin)
 
-**Ob**sidian **session** browser — hence *Obsession*. Browse your
+An agent-session browser for Obsidian. Browse your
 [OpenCode](https://opencode.ai) **v2** sessions directly in
 [Obsidian](https://obsidian.md) — as a dedicated view or as dashboards embedded
 in any note — then open any session and watch it **stream in real time**, send
