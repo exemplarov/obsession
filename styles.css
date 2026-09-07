@@ -409,7 +409,6 @@
 
 .oc-icon-button {
   flex-shrink: 0;
-  margin-left: auto;
   font-size: var(--font-smaller);
 }
 
