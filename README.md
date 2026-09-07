@@ -11,6 +11,8 @@ connectors (local or remote), you can add read-only connectors for **OpenCode
 v1**, **Claude Code**, **Codex CLI**, and **Cursor Agent** histories. OpenCode
 v2 remains the first-class citizen; everything else is a read-only companion.
 
+![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
+
 ![version](https://img.shields.io/badge/version-0.9.0-blue)
 
 ## Connectors
@@ -69,6 +71,23 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Agent questions**: answer the agent's `question` tool inline — options (single/multi-select), yes/no, or custom text — or dismiss it; synced with answers made anywhere. Works across both server generations (form and question APIs).
 - **Offline fallback**: when the server is down, v2 chats show the conversation read-only from `session_v2`/`session_message`.
 - Also exposes an API (`globalThis.obsession`) for e.g. Datacore JSX consumers.
+
+## Screenshots
+
+**Live chat with streaming** — messages, reasoning, and tool calls appear as
+they happen; the composer can send follow-ups or stop a running turn:
+
+![Session chat view streaming a reply: thinking blocks, tool calls with input/output, model picker in the composer](images/session-chat.png)
+
+**Approvals in-app** — permission requests show up as a banner; allow, always
+allow, or reject without leaving the note:
+
+![Session chat with a Needs approval banner and Reject / Always allow / Allow buttons](images/session-approvals.png)
+
+**New sessions** — pick one of your configured directories; the server session
+is created with your first message:
+
+![New OpenCode session dialog with working-directory cards](images/new-session.png)
 
 ## Embed in a note
 
