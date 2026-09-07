@@ -5175,10 +5175,9 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     this.clearConnectorTimers();
     containerEl.empty();
-    containerEl.createEl("h2", { text: "OpenCode Sessions" });
 
     this.renderGlobalSection(containerEl);
-    containerEl.createEl("h3", { text: "Connectors" });
+    new Setting(containerEl).setName("Connectors").setHeading();
     for (const connector of this.plugin.settings.connectors) {
       this.renderConnectorCard(containerEl, connector);
     }
@@ -5186,8 +5185,6 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
   }
 
   renderGlobalSection(containerEl) {
-    containerEl.createEl("h3", { text: "General" });
-
     const registry = this.plugin.registry;
     const entries = registry.all();
     const defaultEntry = registry.defaultConnector();
@@ -5731,7 +5728,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.registerView(VIEW_TYPE_SESSIONS, (leaf) => new OpenCodeSessionsView(leaf, this));
     this.registerView(VIEW_TYPE_SESSION, (leaf) => new SessionChatView(leaf, this));
     this.registerView(VIEW_TYPE_NEW_SESSION, (leaf) => new NewSessionView(leaf, this));
-    // Note-embeddable dashboards: ```opencode-sessions blocks render the same
+    // Note-embeddable dashboards: ```obsession blocks render the same
     // dashboard as the view, configured by the block body. A `connector:`
     // option selects a named connector; without it the default is used.
     this.registerMarkdownCodeBlockProcessor(BLOCK_LANGUAGE, (source, el, ctx) => {
