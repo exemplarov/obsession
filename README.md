@@ -133,9 +133,6 @@ Options (simple `key: value` lines or a JSON object):
 
 Click a card (or table row) to open the live chat view; click a session ID to copy it.
 
-Pre-rename ```obsession blocks keep working — the legacy language is still
-registered.
-
 ## Linking to sessions
 
 Markdown links open the chat tab for a session:
@@ -145,10 +142,9 @@ Markdown links open the chat tab for a session:
 [A claude session](obsidian://vibed?connector=claude&sessionId=<uuid>)
 ```
 
-Pre-rename `obsidian://obsession?…` and `obsidian://opencode-session?…`
-links keep working. `opencode-v1:<id>`-style prefixed ids also work in
-*Open session by ID* (and in `api.open("claude:<uuid>")`). Bare ids resolve
-against the default connector.
+`opencode-v1:<id>`-style prefixed ids also work in *Open session by ID* (and
+in `api.open("claude:<uuid>")`). Bare ids resolve against the default
+connector.
 
 ## Settings
 
@@ -196,14 +192,9 @@ Copy `main.js`, `manifest.json`, and `styles.css` into
 Settings → Community plugins. Desktop only (spawns `sqlite3`/`zstd`, talks to
 local servers).
 
-Upgrading from the pre-rename **Obsession** install? Rename the plugin
-folder (`.obsidian/plugins/obsession` → `.obsidian/plugins/vibed`) so your
-`data.json` (connectors, settings) follows, then replace the three files.
-
 ## API
 
-`globalThis.vibed` (version 4; the pre-rename `globalThis.obsession` and
-`globalThis.opencodeSessions` aliases point to the same object):
+`globalThis.vibed` (version 4):
 
 ```js
 const api = globalThis.vibed;
@@ -212,8 +203,6 @@ api.defaultConnector();              // name of the default connector
 const claude = api.connector("claude");
 const rows = await claude.list({ dirs: ["/abs/path"] });
 await claude.messages("<uuid>", { limit: 100, order: "asc" });
-// v3 surface still works (default connector):
-const rows2 = await api.list({ dirs: ["/abs/path"] });
 const unsubscribe = api.subscribe(() => {});
 api.config();
 api.open("claude:<uuid>");           // also "ses_…" (default connector)

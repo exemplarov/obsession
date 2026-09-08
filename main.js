@@ -10,8 +10,6 @@ const VIEW_TYPE_SESSIONS = "opencode-sessions-view";
 const VIEW_TYPE_SESSION = "opencode-session-view";
 const VIEW_TYPE_NEW_SESSION = "opencode-new-session-view";
 const BLOCK_LANGUAGE = "vibed";
-// Pre-rename block language; notes embedding ```obsession blocks keep working.
-const LEGACY_BLOCK_LANGUAGES = ["obsession"];
 const DEFAULT_REFRESH_SECONDS = 30;
 const DEFAULT_PAGE_SIZE = 10;
 const DEFAULT_MESSAGE_PAGE = 100;
@@ -160,52 +158,38 @@ function dedupeConnectorNames(connectors) {
   }
 }
 
-// Settings schema v2 (named connectors) with migration from the v0.7 flat
-// shape. `migratedFromLegacy` triggers one re-save that drops legacy keys.
-function migrateSettings(saved, vaultRoot) {
+// Settings schema v2 (named connectors). A store without a `connectors`
+// array is a fresh install: create the zero-config local OpenCode v2
+// connector, scoped to the vault (listing needs a directory scope).
+function normalizeSettings(saved, vaultRoot) {
   const pageSize =
     Number.isFinite(saved.pageSize) && saved.pageSize > 0 ? saved.pageSize : DEFAULT_PAGE_SIZE;
   const refreshSeconds = Number.isFinite(saved.refreshSeconds)
     ? saved.refreshSeconds
     : DEFAULT_REFRESH_SECONDS;
-  if (Array.isArray(saved.connectors)) {
-    const connectors = saved.connectors.map(normalizeConnector);
-    dedupeConnectorNames(connectors);
-    return {
-      schemaVersion: 2,
-      defaultConnectorId: connectors.some((c) => c.id === saved.defaultConnectorId)
-        ? saved.defaultConnectorId
-        : connectors[0]?.id || "",
-      pageSize,
-      refreshSeconds,
-      connectors,
-    };
+  let connectors = Array.isArray(saved.connectors) ? saved.connectors.map(normalizeConnector) : null;
+  if (!connectors) {
+    const config = CONNECTOR_KINDS.opencode2.createConfig();
+    if (vaultRoot) config.directories = [vaultRoot];
+    connectors = [
+      normalizeConnector({
+        id: newConnectorId(),
+        kind: "opencode2",
+        name: CONNECTOR_KINDS.opencode2.baseName,
+        enabled: true,
+        config,
+      }),
+    ];
   }
-  const connector = normalizeConnector({
-    id: newConnectorId(),
-    kind: "opencode2",
-    name: "opencode",
-    enabled: true,
-    config: {
-      apiBaseUrl: typeof saved.apiBaseUrl === "string" ? saved.apiBaseUrl : "",
-      apiPassword: typeof saved.apiPassword === "string" ? saved.apiPassword : "",
-      useDatabase: true,
-      databasePath: saved.databasePath || defaultDatabasePath(),
-      sqlitePath: saved.sqlitePath || defaultSqlitePath(),
-      directories:
-        Array.isArray(saved.directories) && saved.directories.length
-          ? saved.directories
-          : [vaultRoot].filter(Boolean),
-      customSql: typeof saved.customSql === "string" ? saved.customSql : "",
-    },
-  });
+  dedupeConnectorNames(connectors);
   return {
     schemaVersion: 2,
-    defaultConnectorId: connector.id,
+    defaultConnectorId: connectors.some((c) => c.id === saved.defaultConnectorId)
+      ? saved.defaultConnectorId
+      : connectors[0]?.id || "",
     pageSize,
     refreshSeconds,
-    connectors: [connector],
-    migratedFromLegacy: true,
+    connectors,
   };
 }
 
@@ -5743,11 +5727,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
   async onload() {
     this.vaultRoot = this.app.vault.adapter?.basePath || "";
     const saved = (await this.loadData()) || {};
-    this.settings = migrateSettings(saved, this.vaultRoot);
-    if (this.settings.migratedFromLegacy) {
-      delete this.settings.migratedFromLegacy;
-      await this.saveData(this.settings); // one-time re-save drops legacy flat keys
-    }
+    this.settings = normalizeSettings(saved, this.vaultRoot);
 
     this.listeners = new Set();
     // `${connectorId}:${sessionID}` -> Set<listener(event)> for open chat views.
@@ -5792,8 +5772,6 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
           stop: (sessionId) => requireV2().client.interrupt(sessionId),
         };
       },
-      list: (query) => this.loadSessions(query),
-      listSessions: (query) => this.loadSessions(query),
       refresh: async () => {
         const rows = await this.loadSessions();
         this.emitChange();
@@ -5842,12 +5820,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
         },
       },
     };
-    this.api.getConfig = this.api.config;
     globalThis.vibed = this.api;
-    // Compat aliases for pre-rename consumers (plugin was "Obsession", and
-    // before that "OpenCode Sessions").
-    globalThis.obsession = this.api;
-    globalThis.opencodeSessions = this.api;
 
     this.registerView(VIEW_TYPE_SESSIONS, (leaf) => new OpenCodeSessionsView(leaf, this));
     this.registerView(VIEW_TYPE_SESSION, (leaf) => new SessionChatView(leaf, this));
@@ -5855,7 +5828,6 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     // Note-embeddable dashboards: ```vibed blocks render the same
     // dashboard as the view, configured by the block body. A `connector:`
     // option selects a named connector; without it the default is used.
-    // The pre-rename ```obsession language stays registered for old notes.
     const blockProcessor = (source, el, ctx) => {
       let options;
       try {
@@ -5867,9 +5839,6 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       ctx.addChild(new SessionsDashboardChild(el, this, options));
     };
     this.registerMarkdownCodeBlockProcessor(BLOCK_LANGUAGE, blockProcessor);
-    for (const language of LEGACY_BLOCK_LANGUAGES) {
-      this.registerMarkdownCodeBlockProcessor(language, blockProcessor);
-    }
     this.addCommand({
       id: "open-sessions",
       name: "Open OpenCode sessions",
@@ -5888,19 +5857,13 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     // Links from notes: [label](obsidian://vibed?sessionId=ses_…)
     // A `connector` parameter names the connector for non-default backends:
     // [label](obsidian://vibed?connector=claude&sessionId=<uuid>)
-    // "obsession" and "opencode-session" are kept as legacy actions for
-    // pre-rename links.
     const protocolHandler = (params) => {
-      const id = [params.sessionId, params.session, params.id].find(
-        (value) => typeof value === "string" && value.trim(),
-      );
+      const id = typeof params.sessionId === "string" ? params.sessionId.trim() : "";
       if (!id) return;
       const connectorName = typeof params.connector === "string" ? params.connector.trim() : "";
-      this.openSession(connectorName ? `${connectorName}:${id.trim()}` : id.trim());
+      this.openSession(connectorName ? `${connectorName}:${id}` : id);
     };
     this.registerObsidianProtocolHandler(BLOCK_LANGUAGE, protocolHandler);
-    this.registerObsidianProtocolHandler("obsession", protocolHandler);
-    this.registerObsidianProtocolHandler("opencode-session", protocolHandler);
     this.addRibbonIcon("messages-square", "Open OpenCode sessions", () => this.activateView());
     this.addSettingTab(new OpenCodeSessionsSettingTab(this.app, this));
     this.configureRefreshTimer();
@@ -5932,12 +5895,10 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.listeners.clear();
     this.sessionListeners.clear();
     if (globalThis.vibed === this.api) delete globalThis.vibed;
-    if (globalThis.obsession === this.api) delete globalThis.obsession;
-    if (globalThis.opencodeSessions === this.api) delete globalThis.opencodeSessions;
   }
 
-  // Compat accessors: the default connector's v2 client / event stream.
-  // Views must use their own connector's driver instead of these.
+  // Default-connector accessors: the default connector's v2 client / event
+  // stream. Views must use their own connector's driver instead of these.
   get client() {
     const driver = this.registry?.defaultConnector()?.driver;
     return driver instanceof OpenCode2Driver ? driver.client : null;

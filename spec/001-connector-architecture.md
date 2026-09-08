@@ -2,7 +2,7 @@
 
 Status: proposed
 Date: 2026-09-04
-Applies to: Vibed (formerly Obsession, and before that opencode-sessions) ≥ 0.8.0
+Applies to: Vibed ≥ 0.8.0
 
 ## 1. Goal
 
@@ -105,20 +105,17 @@ Kind-specific `config` defaults:
   (default `zstd` — only used for `.zst` rollouts), `directories`.
 - `cursor`: `projectsRoot` (default `~/.cursor/projects`), `directories`.
 
-### 4.2 Migration (v0.7 → schemaVersion 2)
+### 4.2 Settings store (schemaVersion 2)
 
-On load, if `saved.connectors` is absent:
+On load, saved settings are normalized against schema v2. A store without
+a `connectors` array is a fresh install:
 
-1. Build one `opencode2` connector from the flat keys: `apiBaseUrl`,
-   `apiPassword`, `databasePath`, `sqlitePath`, `directories`, `customSql`
-   → `config`; `useDatabase: true`; name `opencode`.
+1. Build one `opencode2` connector from kind defaults (`useDatabase: true`,
+   default DB and sqlite3 paths), named `opencode`, `directories` scoped to
+   the vault root (listing needs a scope).
 2. `defaultConnectorId` = that connector's id.
-3. `pageSize`, `refreshSeconds` carry over; legacy flat keys are dropped after
-   the first `saveData`.
-4. Existing `data.json` consumers (`globalThis.vibed.config()`)
-   keep working — see §8.
 
-Migration is transparent: a user upgrading sees identical behavior.
+`pageSize` and `refreshSeconds` carry over when present, else defaults.
 
 ### 4.3 Naming
 
@@ -216,8 +213,8 @@ expressed as `name:sessionId` (e.g. `claude:4108410a-7f35-…`). Names are
 unique and `:`-free, making this unambiguous and human-readable.
 
 - Widget: `connector: claude` (by name) + ids stay plain.
-- Links: `obsidian://vibed?connector=claude&sessionId=<id>`; the
-  legacy `?sessionId=` form resolves against the default connector.
+- Links: `obsidian://vibed?connector=claude&sessionId=<id>`; `?sessionId=`
+  alone resolves against the default connector.
 - `plugin.openSession(ref)` accepts either the pair or a `"name:id"` string.
 
 ### 5.4 Error isolation
@@ -361,17 +358,15 @@ appendix §10 has the raw formats):
 
 ## 8. Public API (`globalThis.vibed`)
 
-Version 4, additive; v3 shapes keep working when only the default connector
-is involved:
+Version 4:
 
 ```js
 api.connectors()                    // [{ id, name, kind, enabled, capabilities }]
 api.connector(name)                 // namespace bound to one connector
   .list(query) .messages(id, opts) .prompt(id, text) .stop(id) .health()
-api.list(query)                     // default connector (v3 behavior)
 api.subscribe(fn)                   // fires for any connector change
 api.open("claude:4108410a-…")       // accepts "name:id"
-api.config()                        // v3 fields + { connectors: [...], defaultConnector }
+api.config()                        // default connector fields + { connectors: [...], defaultConnector }
 ```
 
 ## 9. Widget & chat changes
