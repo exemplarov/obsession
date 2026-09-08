@@ -13,7 +13,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.9.1-blue)
+![version](https://img.shields.io/badge/version-0.9.2-blue)
 
 ## Connectors
 
@@ -161,6 +161,13 @@ transparency, it does access:
   host only — and nothing else.
 - **Helper binaries**: the system `sqlite3` binary (path configurable) and an
   optional `zstd` for Codex transcripts are spawned locally, detached.
+- **System clipboard** (write-only): used solely when you explicitly copy a
+  session ID (clicking the ID on a card, or the *Copy ID* button in a chat).
+  The clipboard is never read.
+
+The file reads and helper binaries above are the entire reason the plugin
+uses Node's `fs` and `child_process` (and therefore is desktop-only) — no
+other files are touched and no other commands are run.
 
 ## Install (manual)
 

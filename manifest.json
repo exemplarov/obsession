@@ -1,9 +1,9 @@
 {
   "id": "obsession",
   "name": "Obsession",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "minAppVersion": "1.4.0",
-  "description": "Browse agent sessions (OpenCode v2/v1, Claude Code, Codex, Cursor) in Obsidian: dedicated view or dashboards embedded in any note. Live streaming and chat for OpenCode, read-only transcripts for the rest.",
+  "description": "Browse agent sessions (OpenCode v2/v1, Claude Code, Codex, Cursor): dedicated view or dashboards embedded in any note. Live streaming and chat for OpenCode, read-only transcripts for the rest.",
   "author": "Roman Exemplarov",
   "authorUrl": "https://github.com/exemplarov",
   "isDesktopOnly": true

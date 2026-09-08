@@ -696,16 +696,18 @@
   font-size: var(--font-smaller);
 }
 
-.oc-permission-allow {
-  color: var(--color-green) !important;
+/* Compound selectors (specificity 0,2,1) keep these ahead of theme button
+   styles; the classes live on the <button> elements themselves. */
+.oc-permission-actions button.oc-permission-allow {
+  color: var(--color-green);
 }
 
-.oc-permission-always {
-  color: var(--text-muted) !important;
+.oc-permission-actions button.oc-permission-always {
+  color: var(--text-muted);
 }
 
-.oc-permission-reject {
-  color: var(--color-red) !important;
+.oc-permission-actions button.oc-permission-reject {
+  color: var(--color-red);
 }
 
 /* Question banner (agent `question` tool) */
@@ -815,16 +817,16 @@
   font-size: var(--font-smaller);
 }
 
-.oc-question-submit {
-  color: var(--color-purple) !important;
+.oc-question-actions button.oc-question-submit {
+  color: var(--color-purple);
 }
 
-.oc-question-submit:disabled {
+.oc-question-actions button.oc-question-submit:disabled {
   opacity: 0.5;
 }
 
-.oc-question-dismiss {
-  color: var(--color-red) !important;
+.oc-question-actions button.oc-question-dismiss {
+  color: var(--color-red);
 }
 
 .oc-composer {

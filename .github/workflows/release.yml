@@ -1,0 +1,54 @@
+# Release packaging for the Obsidian community plugin directory: pushing a
+# version tag (e.g. 0.9.2) cuts a GitHub release with the three plugin files
+# as assets. Artifact attestations are generated for the assets so users can
+# cryptographically verify they came from this repository.
+#
+# The plugin is a no-build, hand-written single file — the committed files
+# are the release assets verbatim, so attesting the checked-out files attests
+# exactly what ships.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write # create the release and upload assets
+  id-token: write # sign attestations
+  attestations: write # store attestations
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches manifest version
+        run: |
+          version="$(jq -r .version manifest.json)"
+          if [ "$GITHUB_REF_NAME" != "$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match manifest.json version $version" >&2
+            exit 1
+          fi
+
+      - name: Syntax check
+        run: node --check main.js
+
+      - name: Create release with plugin assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME"
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
+          main.js manifest.json styles.css
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
