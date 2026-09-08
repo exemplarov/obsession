@@ -6,8 +6,8 @@ tags:
 # Agent sessions dashboard
 
 A dashboard of agent sessions for a couple of workspaces (a current vault plus
-a historical checkout). Rendered natively by the **Obsession** plugin via an
-`obsession` code block — no Datacore involved. Click a title to copy
+a historical checkout). Rendered natively by the **Vibed** plugin via a
+`vibed` code block — no Datacore involved. Click a title to copy
 its session ID; state badge shows **Running…** while a reply is streaming or a
 question is pending.
 
@@ -17,7 +17,7 @@ show directories relative to it), `layout: cards|table`, `pageSize` (defaults
 to the plugin's **Items per page** setting), `title`. The body can be simple
 `key: value` lines or JSON.
 
-```obsession
+```vibed
 layout: cards
 basedir: ~/
 dirs:

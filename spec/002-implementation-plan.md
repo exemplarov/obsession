@@ -30,7 +30,7 @@ change until they add a second connector.
 - [ ] Baseline verification checklist (used again after every phase):
       dashboard view renders, code-block widget renders, chat streams live,
       prompt/stop works, approval banner appears, model selector populates,
-      new-session flow works, `globalThis.obsession` functions.
+      new-session flow works, `globalThis.vibed` functions.
 
 ## Phase 1 — registry + settings + v2 driver extraction (behavior-identical)
 
@@ -205,7 +205,7 @@ tool parts render; v2 connector on the same DB file unaffected.
 - [ ] Per-connector status surfaced on dashboards (error banner text from
       `connector.status.lastError`).
 - [ ] Capability badges in settings cards ("read-only", "live").
-- [ ] `globalThis.obsession` v4 (spec §8) with per-connector
+- [ ] `globalThis.vibed` v4 (spec §8) with per-connector
       namespaces; keep v3 default-connector behavior.
 - [ ] README rewrite: connector model, settings, per-backend caveats table
       (timestamps/titles/tokens support), link/protocol `connector` param.

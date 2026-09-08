@@ -9,7 +9,9 @@ const { execFile } = require("child_process");
 const VIEW_TYPE_SESSIONS = "opencode-sessions-view";
 const VIEW_TYPE_SESSION = "opencode-session-view";
 const VIEW_TYPE_NEW_SESSION = "opencode-new-session-view";
-const BLOCK_LANGUAGE = "obsession";
+const BLOCK_LANGUAGE = "vibed";
+// Pre-rename block language; notes embedding ```obsession blocks keep working.
+const LEGACY_BLOCK_LANGUAGES = ["obsession"];
 const DEFAULT_REFRESH_SECONDS = 30;
 const DEFAULT_PAGE_SIZE = 10;
 const DEFAULT_MESSAGE_PAGE = 100;
@@ -495,7 +497,7 @@ function displayDirectory(directory, vaultRoot) {
     : directory;
 }
 
-// Parses ```obsession block config: a JSON object, or simple
+// Parses ```vibed block config: a JSON object, or simple
 // "key: value" lines with optional "- item" lists (e.g. dirs).
 function parseBlockConfig(source) {
   const text = String(source || "").trim();
@@ -3035,7 +3037,7 @@ class ConnectorRegistry {
 
 // ---------------------------------------------------------------------------
 // Dashboard (session list) — same renderer for the dedicated view and for
-// ```obsession blocks embedded in notes.
+// ```vibed blocks embedded in notes.
 // ---------------------------------------------------------------------------
 
 class SessionsDashboard {
@@ -5841,26 +5843,33 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       },
     };
     this.api.getConfig = this.api.config;
+    globalThis.vibed = this.api;
+    // Compat aliases for pre-rename consumers (plugin was "Obsession", and
+    // before that "OpenCode Sessions").
     globalThis.obsession = this.api;
-    // Compat alias for pre-rename consumers (plugin was "OpenCode Sessions").
     globalThis.opencodeSessions = this.api;
 
     this.registerView(VIEW_TYPE_SESSIONS, (leaf) => new OpenCodeSessionsView(leaf, this));
     this.registerView(VIEW_TYPE_SESSION, (leaf) => new SessionChatView(leaf, this));
     this.registerView(VIEW_TYPE_NEW_SESSION, (leaf) => new NewSessionView(leaf, this));
-    // Note-embeddable dashboards: ```obsession blocks render the same
+    // Note-embeddable dashboards: ```vibed blocks render the same
     // dashboard as the view, configured by the block body. A `connector:`
     // option selects a named connector; without it the default is used.
-    this.registerMarkdownCodeBlockProcessor(BLOCK_LANGUAGE, (source, el, ctx) => {
+    // The pre-rename ```obsession language stays registered for old notes.
+    const blockProcessor = (source, el, ctx) => {
       let options;
       try {
         options = parseBlockConfig(source);
       } catch (error) {
-        el.createEl("pre").setText(`opencode-sessions error: ${error.message}`);
+        el.createEl("pre").setText(`vibed error: ${error.message}`);
         return;
       }
       ctx.addChild(new SessionsDashboardChild(el, this, options));
-    });
+    };
+    this.registerMarkdownCodeBlockProcessor(BLOCK_LANGUAGE, blockProcessor);
+    for (const language of LEGACY_BLOCK_LANGUAGES) {
+      this.registerMarkdownCodeBlockProcessor(language, blockProcessor);
+    }
     this.addCommand({
       id: "open-sessions",
       name: "Open OpenCode sessions",
@@ -5876,10 +5885,11 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       name: "Open session by ID",
       callback: () => this.promptForSessionId(),
     });
-    // Links from notes: [label](obsidian://obsession?sessionId=ses_…)
+    // Links from notes: [label](obsidian://vibed?sessionId=ses_…)
     // A `connector` parameter names the connector for non-default backends:
-    // [label](obsidian://obsession?connector=claude&sessionId=<uuid>)
-    // "opencode-session" is kept as a legacy action for pre-rename links.
+    // [label](obsidian://vibed?connector=claude&sessionId=<uuid>)
+    // "obsession" and "opencode-session" are kept as legacy actions for
+    // pre-rename links.
     const protocolHandler = (params) => {
       const id = [params.sessionId, params.session, params.id].find(
         (value) => typeof value === "string" && value.trim(),
@@ -5888,6 +5898,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       const connectorName = typeof params.connector === "string" ? params.connector.trim() : "";
       this.openSession(connectorName ? `${connectorName}:${id.trim()}` : id.trim());
     };
+    this.registerObsidianProtocolHandler(BLOCK_LANGUAGE, protocolHandler);
     this.registerObsidianProtocolHandler("obsession", protocolHandler);
     this.registerObsidianProtocolHandler("opencode-session", protocolHandler);
     this.addRibbonIcon("messages-square", "Open OpenCode sessions", () => this.activateView());
@@ -5920,6 +5931,7 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.registry?.dispose();
     this.listeners.clear();
     this.sessionListeners.clear();
+    if (globalThis.vibed === this.api) delete globalThis.vibed;
     if (globalThis.obsession === this.api) delete globalThis.obsession;
     if (globalThis.opencodeSessions === this.api) delete globalThis.opencodeSessions;
   }

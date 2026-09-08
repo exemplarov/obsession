@@ -1,4 +1,4 @@
-# Obsession (Obsidian plugin)
+# Vibed (Obsidian plugin)
 
 An agent-session browser for Obsidian. Browse your
 [OpenCode](https://opencode.ai) **v2** sessions directly in
@@ -60,7 +60,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 
 ## Features
 
-- **Note-embedded dashboards** via an `obsession` code block (cards or table layout) — no other plugins required.
+- **Note-embedded dashboards** via a `vibed` code block (cards or table layout) — no other plugins required.
 - **Dedicated view** (command palette: *Open OpenCode sessions*, or the ribbon icon).
 - **Live state tracking** from the v2 event stream (`GET /api/event`): Running…, Idle, Needs approval, Needs answer, Interrupted, Error — updated the instant they change. Falls back to SQLite heuristics when the server is unreachable.
 - **Session chat view**: messages stream in live (text + reasoning + tool calls with input/output); history loads the newest page first and pages in older messages as you scroll to the top. Works for every connector (read-only ones simply don't stream).
@@ -71,7 +71,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Approvals**: permission banners with Allow / Always allow / Reject, synced with replies made anywhere (TUI, other tabs).
 - **Agent questions**: answer the agent's `question` tool inline — options (single/multi-select), yes/no, or custom text — or dismiss it; synced with answers made anywhere. Works across both server generations (form and question APIs).
 - **Offline fallback**: when the server is down, v2 chats show the conversation read-only from `session_v2`/`session_message`.
-- Also exposes an API (`globalThis.obsession`) for e.g. Datacore JSX consumers.
+- Also exposes an API (`globalThis.vibed`) for e.g. Datacore JSX consumers.
 
 ## Screenshots
 
@@ -92,8 +92,13 @@ is created with your first message:
 
 ## Embed in a note
 
+A `vibed` code block renders a dashboard inside any note. The config is
+simple `key: value` lines (or a JSON object).
+
+**Session list** — a directory dashboard, one card per session:
+
 ````markdown
-```obsession
+```vibed
 connector: claude
 layout: cards
 basedir: ~/
@@ -101,6 +106,18 @@ dirs:
   - projects/my-project
 ```
 ````
+
+**Single session** — pin one session id and the block renders a clean
+widget: just the card, no toolbar (ideal for a project status note):
+
+````markdown
+```vibed
+sessions:
+  - ses_abc123def456
+```
+````
+
+A missing id renders as a dashed "(not found)" card rather than an error.
 
 Options (simple `key: value` lines or a JSON object):
 
@@ -116,19 +133,22 @@ Options (simple `key: value` lines or a JSON object):
 
 Click a card (or table row) to open the live chat view; click a session ID to copy it.
 
+Pre-rename ```obsession blocks keep working — the legacy language is still
+registered.
+
 ## Linking to sessions
 
 Markdown links open the chat tab for a session:
 
 ```markdown
-[Yesterday's refactor](obsidian://obsession?sessionId=ses_abc123)
-[A claude session](obsidian://obsession?connector=claude&sessionId=<uuid>)
+[Yesterday's refactor](obsidian://vibed?sessionId=ses_abc123)
+[A claude session](obsidian://vibed?connector=claude&sessionId=<uuid>)
 ```
 
-Pre-rename `obsidian://opencode-session?…` links keep working.
-`opencode-v1:<id>`-style prefixed ids also work in *Open session by ID*
-(and in `api.open("claude:<uuid>")`). Bare ids resolve against the default
-connector.
+Pre-rename `obsidian://obsession?…` and `obsidian://opencode-session?…`
+links keep working. `opencode-v1:<id>`-style prefixed ids also work in
+*Open session by ID* (and in `api.open("claude:<uuid>")`). Bare ids resolve
+against the default connector.
 
 ## Settings
 
@@ -148,7 +168,7 @@ health status, duplicate/delete, and per-kind fields:
 
 ## Privacy & data access
 
-Obsession runs entirely on your machine and contains **no telemetry**. For
+Vibed runs entirely on your machine and contains **no telemetry**. For
 transparency, it does access:
 
 - **Files outside your vaults** (read-only): OpenCode v2/v1
@@ -172,17 +192,21 @@ other files are touched and no other commands are run.
 ## Install (manual)
 
 Copy `main.js`, `manifest.json`, and `styles.css` into
-`<vault>/.obsidian/plugins/obsession/`, then enable **Obsession** under
+`<vault>/.obsidian/plugins/vibed/`, then enable **Vibed** under
 Settings → Community plugins. Desktop only (spawns `sqlite3`/`zstd`, talks to
 local servers).
 
+Upgrading from the pre-rename **Obsession** install? Rename the plugin
+folder (`.obsidian/plugins/obsession` → `.obsidian/plugins/vibed`) so your
+`data.json` (connectors, settings) follows, then replace the three files.
+
 ## API
 
-`globalThis.obsession` (version 4; the pre-rename `globalThis.opencodeSessions`
-alias points to the same object):
+`globalThis.vibed` (version 4; the pre-rename `globalThis.obsession` and
+`globalThis.opencodeSessions` aliases point to the same object):
 
 ```js
-const api = globalThis.obsession;
+const api = globalThis.vibed;
 api.connectors();                    // [{ id, name, kind, enabled, capabilities }]
 api.defaultConnector();              // name of the default connector
 const claude = api.connector("claude");
