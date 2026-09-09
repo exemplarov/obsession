@@ -315,6 +315,27 @@
   gap: 0.6rem;
 }
 
+/* Action block (Copy ID · Refresh · Notes) pinned to the right edge; the
+ * title/chip/badge keep the left. */
+.oc-header-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex-shrink: 0;
+}
+
+/* Icon refresh button: spins while a refresh is in flight. */
+.oc-refresh.oc-busy svg {
+  animation: oc-spin 0.9s linear infinite;
+}
+
+@keyframes oc-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .oc-title {
   font-weight: var(--font-bold);
   font-size: var(--font-large);

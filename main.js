@@ -3809,22 +3809,29 @@ class SessionChatView extends ItemView {
       cls: "opencode-sessions-badge opencode-sessions-badge-none",
       text: "",
     });
-    this.copyButton = titleRow.createEl("button", { cls: "oc-icon-button", text: "Copy ID" });
+    // Action block, anchored to the right edge of the header row:
+    // <Copy ID> <Refresh (icon)> <Notes (icon)>.
+    const headerActions = titleRow.createDiv({ cls: "oc-header-actions" });
+    this.copyButton = headerActions.createEl("button", { cls: "oc-icon-button", text: "Copy ID" });
     this.copyButton.addEventListener("click", () => {
       navigator.clipboard
         .writeText(this.sessionId)
         .then(() => new Notice("Copied session ID"))
         .catch(() => new Notice(this.sessionId));
     });
-    this.notesButton = titleRow.createEl("button", {
+    this.refreshButton = headerActions.createEl("button", {
+      cls: "oc-icon-button oc-refresh",
+      attr: { "aria-label": "Refresh", title: "Refresh" },
+    });
+    setIcon(this.refreshButton, "rotate-cw");
+    this.refreshButton.addEventListener("click", () => this.refresh(true));
+    this.notesButton = headerActions.createEl("button", {
       cls: "oc-icon-button oc-notes-toggle",
       attr: { "aria-label": "Session notes" },
     });
     setIcon(this.notesButton, "sticky-note");
     this.notesButton.style.display = "none";
     this.notesButton.addEventListener("click", () => this.toggleNotes());
-    this.refreshButton = titleRow.createEl("button", { cls: "oc-icon-button oc-refresh", text: "Refresh" });
-    this.refreshButton.addEventListener("click", () => this.refresh(true));
     this.metaEl = header.createDiv({ cls: "oc-meta", text: "Loading…" });
     this.offlineEl = header.createDiv({ cls: "oc-offline", text: "" });
     this.offlineEl.style.display = "none";
@@ -4552,7 +4559,7 @@ class SessionChatView extends ItemView {
     this.refreshing = true;
     if (this.refreshButton) {
       this.refreshButton.disabled = true;
-      this.refreshButton.setText("Refreshing…");
+      this.refreshButton.addClass("oc-busy");
     }
     try {
       await this.loadInitial();
@@ -4560,7 +4567,7 @@ class SessionChatView extends ItemView {
       this.refreshing = false;
       if (this.refreshButton) {
         this.refreshButton.disabled = false;
-        this.refreshButton.setText("Refresh");
+        this.refreshButton.removeClass("oc-busy");
       }
     }
   }
