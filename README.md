@@ -13,7 +13,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.11.0-blue)
+![version](https://img.shields.io/badge/version-0.11.1-blue)
 
 ## Connectors
 
@@ -321,6 +321,8 @@ Idle. OpenCode v1 uses the message-table variant of the v2 fallback.
 ## Development
 
 Plain single-file plugin, no build step (`main.js` is hand-written ES2022).
-`node --check main.js` to syntax-check. Design docs live in `spec/`.
+`node --check main.js` to syntax-check; `node scripts/dashboard-smoke.js`
+runs the dashboard mount/load/render paths against a stubbed DOM (run it
+before releases). Design docs live in `spec/`.
 Excluded from the repo: `data.json` (local settings) and `.hotreload` (dev
 marker).

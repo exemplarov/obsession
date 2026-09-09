@@ -3396,7 +3396,7 @@ class SessionsDashboard {
     this.container = container;
     this.options = options;
     this.sessions = [];
-    this.filterQuery = { tags: [], states: [], phrases: [] };
+    this.filterQuery = { tags: [], states: [], dirs: [], models: [], phrases: [] };
     this.filterMenuEl = null;
     this.filterMenuDismiss = null;
     this.visible = DEFAULT_PAGE_SIZE;
@@ -3626,7 +3626,9 @@ class SessionsDashboard {
 
   filteredSessions() {
     const widgetTags = this.widgetTagSet();
-    const { tags, states, dirs, models, phrases } = this.filterQuery;
+    // Defensive defaults: a future grammar key must degrade, not crash.
+    const { tags = [], states = [], dirs = [], models = [], phrases = [] } =
+      this.filterQuery || {};
     const anyQuery =
       widgetTags || tags.length || states.length || dirs.length || models.length || phrases.length;
     if (!anyQuery) return this.sessions;
