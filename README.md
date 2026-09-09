@@ -13,7 +13,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.10.0-blue)
+![version](https://img.shields.io/badge/version-0.11.0-blue)
 
 ## Connectors
 
@@ -72,6 +72,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Agent questions**: answer the agent's `question` tool inline — options (single/multi-select), yes/no, or custom text — or dismiss it; synced with answers made anywhere. Works across both server generations (form and question APIs).
 - **Offline fallback**: when the server is down, v2 chats show the conversation read-only from `session_v2`/`session_message`.
 - **Session notes**: attach a markdown note to any session (every connector) — a side panel in the chat view with autosave, backed by a normal vault file found by `session:` frontmatter, not filename. See [Session notes](#session-notes).
+- **Session tags**: note tags (Obsidian semantics — frontmatter `tags:` + inline `#tags`) become session tags — editable in the notes panel, shown on cards, filterable (`#tag` in the filter, an advanced filter popover, and a `tags:` widget option). See [Session tags & filtering](#session-tags--filtering).
 - Also exposes an API (`globalThis.vibed`) for e.g. Datacore JSX consumers.
 
 ## Screenshots
@@ -128,11 +129,12 @@ Options (simple `key: value` lines or a JSON object):
 | `dirs` | connector setting | Directories to list sessions for. Relative entries resolve against `basedir`. On OpenCode connectors this **overrides** the connector's configured directories; on Claude/Codex/Cursor it **adds to** them (a filter). |
 | `sessions` | – | Explicit session ids (list). With **only** `sessions` the block renders a clean widget: just the cards, no toolbar. Missing ids render as dashed "(not found)" cards. |
 | `basedir` | – | Prefix for relative `dirs`; cards/tables show directories relative to it. |
+| `tags` | – | Only sessions whose note carries **all** of these tags (list or comma string; intersected with `dirs`). |
 | `layout` | `cards` | `cards` or `table`. |
 | `pageSize` | plugin setting | Sessions per page. |
 | `title` | – | Optional heading above the dashboard. |
 
-Click a card (or table row) to open the live chat view; click a session ID to copy it. Sessions with an attached note show a sticky-note button on their card / title cell — click it to open the note file.
+Click a card (or table row) to open the live chat view; click a session ID to copy it. Sessions with an attached note show a sticky-note button on their card / title cell — click it to open the note file. Tagged sessions show tag chips next to the session ID — click one to filter by it.
 
 ## Linking to sessions
 
@@ -180,6 +182,44 @@ an open panel; a note whose `session:` frontmatter you remove simply reads as
 Back in the session list, cards and table rows of noted sessions get a
 sticky-note button that opens the note file directly — it appears and
 disappears live as notes are created, renamed, or detached.
+
+## Session tags & filtering
+
+A session's tags are its note's tags, with **full Obsidian semantics** —
+the frontmatter `tags:` property plus inline `#tags` in the body, exactly
+what the tag pane and `tag:` search see. Tag a session from the notes
+panel (chips row above the editor: `+` to add, `×` to remove — inline
+body tags are marked read-only, edit the body for those) or from the
+note's properties in the normal editor.
+
+Tags surface in the lists:
+
+- **Cards & tables** show tag chips next to the session ID — click a chip
+  to filter by that tag.
+- **The filter input** is a small query language: `#tag` tokens (AND),
+  `is:<state>` (`is:running`, `is:idle`, …), and free text (quoted
+  phrases for multi-word matches like `"Sonnet 4.5"`). Example:
+  `#urgent is:running deploy`.
+- **The funnel button** next to the input opens an advanced filter
+  popover — per-criteria chips for Tags, State, Model, and Directory with
+  live counts. It edits the same query string, so what you see in the
+  input is always the truth.
+- **Widgets** accept a `tags:` option (list or comma string); only
+  sessions carrying **all** of the tags are listed, intersected with
+  `dirs`:
+
+  ````markdown
+  ```vibed
+  connector: opencode
+  dirs:
+    - projects/my-project
+  tags:
+    - urgent
+  ```
+  ````
+
+`globalThis.vibed.notes.tags("<sessionId>")` returns a session's tags as
+`[{tag, frontmatter, inline}]`.
 
 ## Settings
 
@@ -244,6 +284,7 @@ const unsubscribe = api.subscribe(() => {});
 api.config();
 api.notes.find("ses_…");             // { path, basename } | null — note attached by frontmatter
 api.notes.folder();                  // configured notes folder ("vibed-notes")
+api.notes.tags("ses_…");             // [{tag, frontmatter, inline}] — Obsidian-semantics tags
 api.open("claude:<uuid>");           // also "ses_…" (default connector)
 await api.server.health();           // v2-only namespace
 await api.server.messages("ses_…", { limit: 100, order: "asc" });

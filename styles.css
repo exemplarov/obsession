@@ -107,6 +107,111 @@
   flex-wrap: wrap;
 }
 
+/* ----- advanced filter popover + tag chips ----- */
+
+.opencode-sessions-filter-tools {
+  position: relative;
+  display: inline-flex;
+}
+
+.opencode-sessions-filter-menu-button {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.35rem;
+}
+
+.opencode-sessions-filter-menu-button.oc-active,
+.opencode-sessions-filter-menu-button:hover {
+  color: var(--text-accent);
+}
+
+.opencode-sessions-filter-menu {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  z-index: 20;
+  min-width: 16rem;
+  max-width: 24rem;
+  max-height: 22rem;
+  overflow-y: auto;
+  padding: 0.6rem;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  box-shadow: var(--shadow-s);
+}
+
+.opencode-sessions-filter-group {
+  margin-bottom: 0.5rem;
+}
+
+.opencode-sessions-filter-group:last-child {
+  margin-bottom: 0;
+}
+
+.opencode-sessions-filter-group-label {
+  font-size: var(--font-smallest);
+  font-weight: var(--font-bold);
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.3rem;
+}
+
+.opencode-sessions-filter-group-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.opencode-sessions-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: var(--font-smaller);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.opencode-sessions-filter-chip:hover {
+  border-color: var(--interactive-accent);
+  color: var(--text-normal);
+}
+
+.opencode-sessions-filter-chip.oc-active {
+  background: color-mix(in srgb, var(--interactive-accent) 18%, var(--background-secondary));
+  border-color: color-mix(in srgb, var(--interactive-accent) 40%, transparent);
+  color: var(--text-accent);
+}
+
+.opencode-sessions-filter-empty {
+  font-size: var(--font-smaller);
+  color: var(--text-faint);
+}
+
+/* Session tag chips on cards / table rows (next to the session ID). */
+.opencode-sessions-tag-chip {
+  display: inline-block;
+  margin-left: 0.35rem;
+  padding: 0 0.3rem;
+  border-radius: var(--radius-s);
+  font-size: var(--font-smallest);
+  font-family: var(--font-monospace);
+  color: var(--text-accent);
+  background: color-mix(in srgb, var(--interactive-accent) 10%, transparent);
+  cursor: pointer;
+  user-select: none;
+}
+
+.opencode-sessions-tag-chip:hover {
+  background: color-mix(in srgb, var(--interactive-accent) 22%, transparent);
+}
+
+
 .opencode-sessions-cards-count {
   color: var(--text-muted);
 }
@@ -559,6 +664,72 @@
   color: var(--text-faint);
   font-size: var(--font-smallest);
 }
+
+/* Tag chips row (Obsidian-properties feel) above the note body editor. */
+.oc-notes-tags {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  padding-bottom: 0.45rem;
+  margin-bottom: 0.45rem;
+  border-bottom: 1px dashed var(--background-modifier-border);
+}
+
+.oc-notes-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: var(--font-smaller);
+  font-family: var(--font-monospace);
+  color: var(--text-accent);
+  background: color-mix(in srgb, var(--interactive-accent) 10%, transparent);
+}
+
+.oc-notes-tag-inline {
+  opacity: 0.7;
+  cursor: help;
+}
+
+.oc-notes-tag-x {
+  cursor: pointer;
+  color: var(--text-faint);
+  padding: 0 0.1rem;
+}
+
+.oc-notes-tag-x:hover {
+  color: var(--text-error);
+}
+
+.oc-notes-tag-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  padding: 0;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 999px;
+  color: var(--text-faint);
+  background: transparent;
+  cursor: pointer;
+}
+
+.oc-notes-tag-add:hover {
+  color: var(--text-accent);
+  border-color: var(--interactive-accent);
+}
+
+.oc-notes-tag-input {
+  width: 10rem;
+  font-family: var(--font-monospace);
+  font-size: var(--font-smaller);
+  padding: 0.05rem 0.4rem;
+}
+
 
 .oc-offline {
   margin-top: 0.35rem;

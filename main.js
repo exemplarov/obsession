@@ -578,6 +578,94 @@ function parseBlockConfig(source) {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard filter query. Tokens: `#tag` (session-note tag), `is:<state>`
+// (live state), quoted phrases or bare words (substring match over the
+// combined row labels). All criteria AND together; everything is optional.
+// The string is the single source of truth — the advanced filter popover
+// and tag chips rewrite it, the input parses it.
+// ---------------------------------------------------------------------------
+
+function parseFilterQuery(raw) {
+  const tags = [];
+  const states = [];
+  const phrases = [];
+  const rx = /"([^"]*)"|(\S+)/g;
+  let match;
+  while ((match = rx.exec(String(raw || "")))) {
+    if (match[1] !== undefined) {
+      if (match[1].trim()) phrases.push(match[1].trim());
+      continue;
+    }
+    const token = match[2];
+    if (token.length > 1 && token.startsWith("#")) tags.push(token.slice(1));
+    else if (/^is:[a-z-]+$/i.test(token)) states.push(token.slice(3));
+    else phrases.push(token);
+  }
+  return { tags, states, phrases };
+}
+
+function composeFilterQuery(parts) {
+  return [
+    ...parts.tags.map((tag) => `#${tag}`),
+    ...parts.states.map((state) => `is:${state}`),
+    ...parts.phrases.map((phrase) => (/^[\w:/.-]+$/.test(phrase) ? phrase : `"${phrase}"`)),
+  ].join(" ");
+}
+
+// Obsidian tag charset: letters, digits, _, -, / (nested). Everything else
+// collapses out — matches what the properties editor would accept.
+function sanitizeTagName(value) {
+  return String(value || "")
+    .replace(/^#+/, "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_/-]/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+// Parses the `tags:` value from a raw frontmatter block: flow list
+// (`tags: [a, b]`), comma string, or block list (indented `- x` lines).
+function parseFrontmatterTags(frontmatter) {
+  const lines = String(frontmatter || "").split(/\r?\n/);
+  const index = lines.findIndex((line) => /^tags:\s*(.*)$/.test(line));
+  if (index === -1) return [];
+  const unquote = (value) => value.trim().replace(/^["']|["']$/g, "");
+  const inline = lines[index].replace(/^tags:\s*/, "").trim();
+  if (inline) {
+    const inner = inline.startsWith("[") && inline.endsWith("]") ? inline.slice(1, -1) : inline;
+    return inner.split(",").map(unquote).filter(Boolean);
+  }
+  const tags = [];
+  for (let i = index + 1; i < lines.length; i += 1) {
+    const match = /^(\s+)-\s+(.*)$/.exec(lines[i]);
+    if (!match) break;
+    const value = unquote(match[2]);
+    if (value) tags.push(value);
+  }
+  return tags;
+}
+
+// Replaces (or inserts) the `tags:` key in a raw frontmatter block as a flow
+// list; other keys and their formatting are untouched. Written tags are
+// pre-sanitized, so bare values are always YAML-safe.
+function upsertFrontmatterTags(frontmatter, tags) {
+  const lines = String(frontmatter || "").split(/\r?\n/);
+  const flow = `tags: [${tags.join(", ")}]`;
+  const index = lines.findIndex((line) => /^tags:\s*(.*)$/.test(line));
+  if (index === -1) {
+    // Right after `session:` — every vibed note carries it.
+    lines.splice(Math.min(1, lines.length), 0, flow);
+    return lines.join("\n");
+  }
+  lines[index] = flow;
+  let end = index + 1;
+  while (end < lines.length && /^\s+-\s+/.test(lines[end])) end += 1;
+  lines.splice(index + 1, end - (index + 1));
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // HTTP transport. Node's http/https modules instead of fetch: the v2 server
 // does not send CORS headers, and the Obsidian renderer enforces CORS on
 // fetch/EventSource — so browser-network APIs cannot reach localhost:port.
@@ -3095,6 +3183,8 @@ class SessionNotes {
     // frontmatter edit removes the stale mapping without a full rebuild).
     this.bySession = new Map();
     this.sessionByFile = new Map();
+    // sessionId -> Map<normalizedTag, {display, frontmatter, inline}>
+    this.tagsBySession = new Map();
   }
 
   // Accepts the `session` frontmatter value in its YAML-decoded form.
@@ -3105,37 +3195,85 @@ class SessionNotes {
     return null;
   }
 
+  // Extracts the note's tags with Obsidian tag-pane semantics: the
+  // frontmatter `tags` property (list, comma string, or scalar) plus inline
+  // #tags from the body. Keys are normalized (lowercase, no "#") for
+  // case-insensitive matching; `display` keeps the first-seen spelling.
+  static tagsOf(cache) {
+    const tags = new Map();
+    const add = (raw, source) => {
+      const display = String(raw ?? "")
+        .replace(/^#/, "")
+        .trim();
+      if (!display) return;
+      const key = display.toLowerCase();
+      const entry = tags.get(key) || { display, frontmatter: false, inline: false };
+      if (source === "frontmatter") entry.frontmatter = true;
+      else entry.inline = true;
+      tags.set(key, entry);
+    };
+    const fmTags = cache?.frontmatter?.tags;
+    if (Array.isArray(fmTags)) fmTags.forEach((tag) => add(tag, "frontmatter"));
+    else if (typeof fmTags === "string") fmTags.split(",").forEach((tag) => add(tag, "frontmatter"));
+    else if (typeof fmTags === "number") add(String(fmTags), "frontmatter");
+    for (const tag of cache?.tags || []) add(tag?.tag, "inline");
+    return tags;
+  }
+
+  // Stable serialization of a tag map for change detection.
+  static tagsSignature(tags) {
+    return [...tags.entries()]
+      .map(([key, info]) => `${key}:${info.display}:${info.frontmatter ? 1 : 0}:${info.inline ? 1 : 0}`)
+      .sort()
+      .join("|");
+  }
+
   // Startup / metadata-resolved pass. Cheap: reads only cached metadata,
   // never touches the disk.
   buildIndex() {
     this.bySession.clear();
     this.sessionByFile.clear();
+    this.tagsBySession.clear();
     for (const file of this.app.vault.getMarkdownFiles()) this.indexFile(file);
   }
 
   // Upsert one file's index entry from its (possibly just-changed) cache.
-  // Returns true only when the id → file mapping actually changed ( callers
-  // use it to refresh dashboards; plain body edits must not).
+  // Returns true only when the id → file mapping or the session's tag set
+  // actually changed (callers refresh dashboards on true; tag-less body
+  // edits must not trigger it).
   indexFile(file) {
     const previousId = this.sessionByFile.get(file) || null;
-    let id = null;
+    let cache = null;
     try {
-      id = SessionNotes.sessionKeyOf(this.app.metadataCache.getFileCache(file)?.frontmatter);
+      cache = this.app.metadataCache.getFileCache(file);
     } catch {
-      id = null;
+      cache = null;
     }
+    const id = cache ? SessionNotes.sessionKeyOf(cache.frontmatter) : null;
     if (!id) {
       if (!previousId) return false;
       this.sessionByFile.delete(file);
-      if (this.bySession.get(previousId) === file) this.bySession.delete(previousId);
+      if (this.bySession.get(previousId) === file) {
+        this.bySession.delete(previousId);
+        this.tagsBySession.delete(previousId);
+      }
       return true;
     }
-    if (previousId === id && this.bySession.get(id) === file) return false;
+    const tags = SessionNotes.tagsOf(cache);
+    const previousTags = this.tagsBySession.get(id) || null;
+    const tagsChanged =
+      !previousTags || SessionNotes.tagsSignature(previousTags) !== SessionNotes.tagsSignature(tags);
+    if (previousId === id && this.bySession.get(id) === file) {
+      if (tagsChanged) this.tagsBySession.set(id, tags);
+      return tagsChanged;
+    }
     if (previousId && previousId !== id && this.bySession.get(previousId) === file) {
       this.bySession.delete(previousId);
+      this.tagsBySession.delete(previousId);
     }
     this.bySession.set(id, file);
     this.sessionByFile.set(file, id);
+    this.tagsBySession.set(id, tags);
     return true;
   }
 
@@ -3144,7 +3282,10 @@ class SessionNotes {
     const id = this.sessionByFile.get(file);
     if (!id) return false;
     this.sessionByFile.delete(file);
-    if (this.bySession.get(id) === file) this.bySession.delete(id);
+    if (this.bySession.get(id) === file) {
+      this.bySession.delete(id);
+      this.tagsBySession.delete(id);
+    }
     return true;
   }
 
@@ -3152,6 +3293,12 @@ class SessionNotes {
 
   find(sessionId) {
     return this.bySession.get(sessionId) || null;
+  }
+
+  // Session tags as Map<normalized, {display, frontmatter, inline}>; empty
+  // (never null) for sessions without a note — callers iterate freely.
+  tags(sessionId) {
+    return this.tagsBySession.get(sessionId) || new Map();
   }
 
   // Returns the existing note for the session, or creates one in the notes
@@ -3209,7 +3356,9 @@ class SessionsDashboard {
     this.container = container;
     this.options = options;
     this.sessions = [];
-    this.filterNeedle = "";
+    this.filterQuery = { tags: [], states: [], phrases: [] };
+    this.filterMenuEl = null;
+    this.filterMenuDismiss = null;
     this.visible = DEFAULT_PAGE_SIZE;
     this.disposed = false;
     // Connectors are referenced by name in block configs; omitting one uses
@@ -3296,13 +3445,23 @@ class SessionsDashboard {
       this.filterInput = toolbar.createEl("input", {
         type: "search",
         cls: "opencode-sessions-cards-filter",
-        placeholder: "Filter title, state, model, agent, or session ID…",
+        placeholder: "Filter: #tag, is:running, or text…",
       });
       this.filterInput.addEventListener("input", () => {
-        this.filterNeedle = this.filterInput.value.trim().toLowerCase();
+        this.filterQuery = parseFilterQuery(this.filterInput.value);
         this.visible = this.basePageSize();
         this.render();
       });
+      // Advanced filters: a popover of per-criteria chips (tags, state,
+      // model, directory) that edits the same query string as the input.
+      const filterTools = toolbar.createDiv({ cls: "opencode-sessions-filter-tools" });
+      this.filterToolsEl = filterTools;
+      const filterMenuButton = filterTools.createEl("button", {
+        cls: "opencode-sessions-filter-menu-button",
+        attr: { "aria-label": "Advanced filters", title: "Advanced filters" },
+      });
+      setIcon(filterMenuButton, "list-filter");
+      filterMenuButton.addEventListener("click", () => this.toggleFilterMenu());
       const refreshButton = toolbar.createEl("button", { text: "Refresh" });
       refreshButton.addEventListener("click", () => this.load());
       // New sessions need a drafts-capable connector (OpenCode v2) — the
@@ -3351,6 +3510,7 @@ class SessionsDashboard {
 
   destroy() {
     this.disposed = true;
+    this.closeFilterMenu();
     if (this.unsubscribe) this.unsubscribe();
   }
 
@@ -3402,15 +3562,62 @@ class SessionsDashboard {
     this.render();
   }
 
+  // Widget-level tag pin from the block config (`tags:` list or comma
+  // string) — intersected with directory filtering and the live query.
+  widgetTagSet() {
+    const raw = this.options.tags;
+    const normalize = (value) =>
+      String(value || "")
+        .replace(/^#/, "")
+        .trim()
+        .toLowerCase();
+    const entries = Array.isArray(raw)
+      ? raw.map(normalize)
+      : typeof raw === "string"
+        ? raw.split(",").map(normalize)
+        : [];
+    const set = new Set(entries.filter(Boolean));
+    return set.size ? set : null;
+  }
+
+  sessionHasTag(session, normalized) {
+    return (this.plugin.notes?.tags(session.id) || new Map()).has(normalized);
+  }
+
   filteredSessions() {
-    if (!this.filterNeedle) return this.sessions;
-    return this.sessions.filter((session) =>
-      [session.titleLabel, session.stateLabel, session.directoryLabel, session.modelLabel, session.agent, session.id]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-        .includes(this.filterNeedle),
-    );
+    const widgetTags = this.widgetTagSet();
+    const { tags, states, phrases } = this.filterQuery;
+    if (!widgetTags && !tags.length && !states.length && !phrases.length) return this.sessions;
+    return this.sessions.filter((session) => {
+      if (widgetTags) {
+        for (const tag of widgetTags) {
+          if (!this.sessionHasTag(session, tag)) return false;
+        }
+      }
+      for (const tag of tags) {
+        if (!this.sessionHasTag(session, tag.toLowerCase())) return false;
+      }
+      if (states.length && !states.includes(String(session.state || "").toLowerCase())) {
+        return false;
+      }
+      if (phrases.length) {
+        const blob = [
+          session.titleLabel,
+          session.stateLabel,
+          session.directoryLabel,
+          session.modelLabel,
+          session.agent,
+          session.id,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        for (const phrase of phrases) {
+          if (!blob.includes(phrase.toLowerCase())) return false;
+        }
+      }
+      return true;
+    });
   }
 
   render() {
@@ -3457,6 +3664,146 @@ class SessionsDashboard {
       .writeText(sessionId)
       .then(() => new Notice(`Copied ${sessionId}`))
       .catch(() => new Notice(sessionId));
+  }
+
+  // ----- filtering -------------------------------------------------------------
+
+  // Toggles one criterion in the query and rewrites the input to match —
+  // the string stays the single source of truth. kind: "tag" | "state" | "phrase".
+  toggleFilter(kind, value) {
+    const parts = {
+      tags: [...this.filterQuery.tags],
+      states: [...this.filterQuery.states],
+      phrases: [...this.filterQuery.phrases],
+    };
+    const list = kind === "tag" ? parts.tags : kind === "state" ? parts.states : parts.phrases;
+    const key = value.toLowerCase();
+    const index = list.findIndex((entry) => entry.toLowerCase() === key);
+    if (index >= 0) list.splice(index, 1);
+    else list.push(value);
+    const composed = composeFilterQuery(parts);
+    this.filterQuery = parseFilterQuery(composed);
+    if (this.filterInput) this.filterInput.value = composed;
+    this.visible = this.basePageSize();
+    if (this.filterMenuEl) this.renderFilterMenu();
+    this.render();
+  }
+
+  toggleFilterMenu() {
+    if (this.filterMenuEl) {
+      this.closeFilterMenu();
+      return;
+    }
+    this.filterMenuEl = this.filterToolsEl.createDiv({ cls: "opencode-sessions-filter-menu" });
+    this.renderFilterMenu();
+    this.filterMenuDismiss = (event) => {
+      if (this.filterToolsEl && !this.filterToolsEl.contains(event.target)) this.closeFilterMenu();
+    };
+    document.addEventListener("click", this.filterMenuDismiss);
+  }
+
+  closeFilterMenu() {
+    if (this.filterMenuDismiss) {
+      document.removeEventListener("click", this.filterMenuDismiss);
+      this.filterMenuDismiss = null;
+    }
+    this.filterMenuEl?.remove();
+    this.filterMenuEl = null;
+  }
+
+  // Chip groups for every criterion present in the (unfiltered) list; each
+  // chip shows its live count and reflects whether it is in the query.
+  renderFilterMenu() {
+    const menu = this.filterMenuEl;
+    if (!menu) return;
+    menu.empty();
+
+    const group = (label) => {
+      const section = menu.createDiv({ cls: "opencode-sessions-filter-group" });
+      section.createDiv({ cls: "opencode-sessions-filter-group-label", text: label });
+      return section.createDiv({ cls: "opencode-sessions-filter-group-chips" });
+    };
+    const chip = (container, text, active, count, onClick) => {
+      const el = container.createSpan({
+        cls: `opencode-sessions-filter-chip${active ? " oc-active" : ""}`,
+        text: count === undefined ? text : `${text} · ${count}`,
+      });
+      el.addEventListener("click", onClick);
+      return el;
+    };
+
+    // Tags: from the notes index, counted across listed sessions.
+    const tagCounts = new Map();
+    for (const session of this.sessions) {
+      for (const [key, info] of this.plugin.notes?.tags(session.id) || new Map()) {
+        const entry = tagCounts.get(key) || { display: info.display, count: 0 };
+        entry.count += 1;
+        tagCounts.set(key, entry);
+      }
+    }
+    const tagGroup = group("Tags");
+    if (!tagCounts.size) {
+      tagGroup.createSpan({
+        cls: "opencode-sessions-filter-empty",
+        text: "None yet — tag a session from its chat notes panel",
+      });
+    } else {
+      const activeTags = new Set(this.filterQuery.tags.map((tag) => tag.toLowerCase()));
+      for (const [key, info] of [...tagCounts.entries()].sort((a, b) => b[1].count - a[1].count)) {
+        chip(
+          tagGroup,
+          `#${info.display}`,
+          activeTags.has(key),
+          info.count,
+          () => this.toggleFilter("tag", info.display),
+        );
+      }
+    }
+
+    // State: labels for the states actually present.
+    const stateCounts = new Map();
+    for (const session of this.sessions) {
+      const state = String(session.state || "").toLowerCase();
+      if (!state) continue;
+      stateCounts.set(state, (stateCounts.get(state) || 0) + 1);
+    }
+    const stateGroup = group("State");
+    const activeStates = new Set(this.filterQuery.states.map((state) => state.toLowerCase()));
+    for (const [state, count] of [...stateCounts.entries()].sort((a, b) => b[1] - a[1])) {
+      chip(
+        stateGroup,
+        STATE_LABELS[state] || state,
+        activeStates.has(state),
+        count,
+        () => this.toggleFilter("state", state),
+      );
+    }
+
+    // Model / Directory: label phrases (quoted in the query when they
+    // contain spaces).
+    const labelGroup = (label, field) => {
+      const counts = new Map();
+      for (const session of this.sessions) {
+        const value = String(session[field] || "").trim();
+        if (!value) continue;
+        counts.set(value, (counts.get(value) || 0) + 1);
+      }
+      if (!counts.size) return null;
+      const chips = group(label);
+      const activePhrases = new Set(this.filterQuery.phrases.map((phrase) => phrase.toLowerCase()));
+      for (const [value, count] of [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)) {
+        chip(
+          chips,
+          value,
+          activePhrases.has(value.toLowerCase()),
+          count,
+          () => this.toggleFilter("phrase", value),
+        );
+      }
+      return chips;
+    };
+    labelGroup("Model", "modelLabel");
+    labelGroup("Directory", "directoryLabel");
   }
 
   // The vault note attached to this session, if any (frontmatter index).
@@ -3518,6 +3865,24 @@ class SessionsDashboard {
         this.copyId(session.id);
       });
       if (session.tokensLabel) sub.appendText(` · ${session.tokensLabel} tokens`);
+      this.renderTagChips(sub, session);
+    }
+  }
+
+  // Session tags (from its note) as clickable chips — clicking toggles the
+  // tag into the filter. Also used by the table's Session ID cell.
+  renderTagChips(container, session) {
+    const tags = this.plugin.notes?.tags(session.id) || new Map();
+    for (const info of tags.values()) {
+      const chipEl = container.createSpan({
+        cls: "opencode-sessions-tag-chip",
+        text: `#${info.display}`,
+      });
+      chipEl.title = "Filter by tag";
+      chipEl.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.toggleFilter("tag", info.display);
+      });
     }
   }
 
@@ -3552,6 +3917,7 @@ class SessionsDashboard {
         event.stopPropagation();
         this.copyId(session.id);
       });
+      this.renderTagChips(idCell, session);
     }
   }
 }
@@ -4197,6 +4563,8 @@ class SessionChatView extends ItemView {
       return;
     }
 
+    this.noteTagsEl = this.notesPanelEl.createDiv({ cls: "oc-notes-tags" });
+    this.renderNoteTagsRow();
     this.noteArea = this.notesPanelEl.createEl("textarea", {
       cls: "oc-notes-area",
       attr: { placeholder: "Notes for this session… (frontmatter is preserved)", spellcheck: "false" },
@@ -4212,9 +4580,111 @@ class SessionChatView extends ItemView {
   teardownNotesPanel() {
     this.notesPanelEl?.remove();
     this.notesPanelEl = null;
+    this.noteTagsEl = null;
+    this.noteTagInputEl = null;
     this.noteArea = null;
     this.noteStatusEl = null;
     this.contentEl?.removeClass("has-notes");
+  }
+
+  // Tag chips with Obsidian-properties feel: frontmatter tags are removable
+  // (×), inline body tags are marked read-only (edit the body to change
+  // them — exactly like the tag pane treats them).
+  renderNoteTagsRow() {
+    if (!this.noteTagsEl) return;
+    this.noteTagsEl.empty();
+    this.noteTagInputEl = null;
+    const tags = this.plugin.notes ? this.plugin.notes.tags(this.sessionId) : new Map();
+    for (const info of tags.values()) {
+      const chipEl = this.noteTagsEl.createSpan({ cls: "oc-notes-tag" });
+      chipEl.createSpan({ cls: "oc-notes-tag-name", text: `#${info.display}` });
+      if (info.frontmatter) {
+        const removeEl = chipEl.createSpan({ cls: "oc-notes-tag-x", text: "×" });
+        removeEl.title = "Remove tag";
+        removeEl.addEventListener("click", () => this.removeNoteTag(info.display));
+      } else {
+        chipEl.addClass("oc-notes-tag-inline");
+        chipEl.title = "Inline tag — edit the note body to change it";
+      }
+    }
+    const addButton = this.noteTagsEl.createEl("button", {
+      cls: "oc-notes-tag-add",
+      attr: { "aria-label": "Add tag", title: "Add tag" },
+    });
+    setIcon(addButton, "plus");
+    addButton.addEventListener("click", () => this.beginAddNoteTag());
+  }
+
+  beginAddNoteTag() {
+    if (!this.noteTagsEl || this.noteTagInputEl) return;
+    const input = this.noteTagsEl.createEl("input", {
+      cls: "oc-notes-tag-input",
+      attr: { placeholder: "tag — Enter to add, Esc to cancel", spellcheck: "false" },
+    });
+    this.noteTagInputEl = input;
+    input.focus();
+    const commit = async () => {
+      if (this.noteTagInputEl !== input) return;
+      this.noteTagInputEl = null;
+      const value = sanitizeTagName(input.value);
+      input.remove();
+      this.renderNoteTagsRow();
+      if (value) await this.addNoteTag(value);
+    };
+    const cancel = () => {
+      if (this.noteTagInputEl !== input) return;
+      this.noteTagInputEl = null;
+      input.remove();
+      this.renderNoteTagsRow();
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        commit();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        cancel();
+      }
+    });
+    input.addEventListener("blur", () => commit());
+  }
+
+  async addNoteTag(display) {
+    await this.applyNoteTags((tags) =>
+      tags.some((tag) => tag.toLowerCase() === display.toLowerCase()) ? tags : [...tags, display],
+    );
+  }
+
+  async removeNoteTag(display) {
+    const key = display.toLowerCase();
+    await this.applyNoteTags((tags) => tags.filter((tag) => tag.toLowerCase() !== key));
+  }
+
+  // Rewrites the frontmatter `tags:` list. Creates the note on first tag and
+  // flushes any pending body edit first, so nothing typed is ever lost.
+  async applyNoteTags(mutate) {
+    if (!this.sessionId || !this.plugin.notes) return;
+    try {
+      if (!this.noteFile) {
+        await this.createNote();
+        if (!this.noteFile) return;
+      } else if (this.noteSaveTimer) {
+        window.clearTimeout(this.noteSaveTimer);
+        this.noteSaveTimer = null;
+        await this.saveNoteNow();
+      }
+      const next = mutate(parseFrontmatterTags(this.noteFrontmatter));
+      const frontmatter = upsertFrontmatterTags(this.noteFrontmatter, next);
+      const body = this.noteArea ? this.noteArea.value : this.noteBody;
+      await this.app.vault.modify(this.noteFile, `---\n${frontmatter}\n---\n${body}`);
+      this.noteFrontmatter = frontmatter;
+      this.noteBody = body;
+      this.noteSavePending = false;
+      if (this.noteStatusEl) this.noteStatusEl.setText("Saved");
+      this.renderNoteTagsRow();
+    } catch (error) {
+      new Notice(`Could not update tags: ${error.message}`);
+    }
   }
 
   // Resolves the session's note from the frontmatter index. A file whose
@@ -6304,13 +6774,22 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
         defaultConnector: this.registry.defaultConnector()?.connector.name || null,
       }),
       open: (ref) => this.openSession(ref),
-      // Vault-side session notes: find(sessionId) -> { path } | null.
+      // Vault-side session notes: find(sessionId) -> { path } | null;
+      // tags(sessionId) -> [{tag, frontmatter, inline}] (Obsidian semantics).
       notes: {
         find: (sessionId) => {
           const file = this.notes?.find(sessionId);
           return file ? { path: file.path, basename: file.basename } : null;
         },
         folder: () => this.settings.notesDir,
+        tags: (sessionId) => {
+          const tags = this.notes?.tags(sessionId) || new Map();
+          return [...tags.values()].map((info) => ({
+            tag: info.display,
+            frontmatter: info.frontmatter,
+            inline: info.inline,
+          }));
+        },
       },
       server: {
         connected: () => this.serverEvents?.connected || false,
