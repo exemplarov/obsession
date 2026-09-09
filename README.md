@@ -196,10 +196,12 @@ Tags surface in the lists:
 
 - **Cards & tables** show tag chips next to the session ID — click a chip
   to filter by that tag.
-- **The filter input** is a small query language: `#tag` tokens (AND),
-  `is:<state>` (`is:running`, `is:idle`, …), and free text (quoted
-  phrases for multi-word matches like `"Sonnet 4.5"`). Example:
-  `#urgent is:running deploy`.
+- **The filter input** is a small query language — prefixes make each
+  criterion explicit, everything ANDs together:
+  `#tag` (session tags), `is:<state>` (`is:running`, `is:idle`, …),
+  `dir:<path>` and `model:<name>` (substrings; quote values with spaces,
+  e.g. `model:"Sonnet 4.5"`), and free text (matches the session title).
+  Example: `#urgent is:running model:"Sonnet 4.5" deploy`.
 - **The funnel button** next to the input opens an advanced filter
   popover — per-criteria chips for Tags, State, Model, and Directory with
   live counts. It edits the same query string, so what you see in the

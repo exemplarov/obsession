@@ -26,14 +26,19 @@ store: the vault is the source of truth.
 
 ```
 query    := token*
-token    := "#" tag            → tag filter (case-insensitive)
-          | "is:" state        → running|suspended|idle|waiting|question|interrupted|error
-          | '"' phrase '"'     → substring over combined row labels
-          | word               → substring over combined row labels
+token    := "#" value            → tag filter (case-insensitive)
+          | "is:" value          → state: running|suspended|idle|waiting|question|interrupted|error
+          | "dir:" value         → substring over raw + display directory
+          | "model:" value       → substring over raw + display model
+          | '"' phrase '"'       → substring over the session title
+          | word                 → substring over the session title
 ```
 
-All tokens AND. `parseFilterQuery` / `composeFilterQuery` round-trip (order
-preserved, phrases re-quoted when they contain spaces).
+All tokens AND. Values may be quoted for spaces (`model:"Sonnet 4.5"`);
+bare prefixes while typing are ignored. `parseFilterQuery` /
+`composeFilterQuery` round-trip (order preserved, values re-quoted when
+needed). Free text matches the **title only** — every other axis has an
+explicit prefix.
 
 ## Implementation map (main.js)
 

@@ -579,36 +579,76 @@ function parseBlockConfig(source) {
 
 // ---------------------------------------------------------------------------
 // Dashboard filter query. Tokens: `#tag` (session-note tag), `is:<state>`
-// (live state), quoted phrases or bare words (substring match over the
-// combined row labels). All criteria AND together; everything is optional.
-// The string is the single source of truth — the advanced filter popover
-// and tag chips rewrite it, the input parses it.
+// (live state), `dir:<path>` and `model:<name>` (substring over raw and
+// formatted values), free text (substring over the session title). Values
+// may be quoted (`model:"Sonnet 4.5"`). All criteria AND together; the
+// string is the single source of truth — the advanced filter popover and
+// tag chips rewrite it, the input parses it.
 // ---------------------------------------------------------------------------
 
 function parseFilterQuery(raw) {
-  const tags = [];
-  const states = [];
-  const phrases = [];
-  const rx = /"([^"]*)"|(\S+)/g;
-  let match;
-  while ((match = rx.exec(String(raw || "")))) {
-    if (match[1] !== undefined) {
-      if (match[1].trim()) phrases.push(match[1].trim());
+  const out = { tags: [], states: [], dirs: [], models: [], phrases: [] };
+  const text = String(raw || "");
+  let i = 0;
+  // Reads a value at the cursor: a "quoted string" or a bare non-space run.
+  const readValue = () => {
+    if (text[i] === '"') {
+      const end = text.indexOf('"', i + 1);
+      if (end === -1) {
+        const value = text.slice(i + 1).trim();
+        i = text.length;
+        return value;
+      }
+      const value = text.slice(i + 1, end);
+      i = end + 1;
+      return value;
+    }
+    let j = i;
+    while (j < text.length && !/\s/.test(text[j])) j += 1;
+    const value = text.slice(i, j);
+    i = j;
+    return value;
+  };
+  while (i < text.length) {
+    while (i < text.length && /\s/.test(text[i])) i += 1;
+    if (i >= text.length) break;
+    if (text[i] === '"') {
+      const value = readValue().trim();
+      if (value) out.phrases.push(value);
       continue;
     }
-    const token = match[2];
-    if (token.length > 1 && token.startsWith("#")) tags.push(token.slice(1));
-    else if (/^is:[a-z-]+$/i.test(token)) states.push(token.slice(3));
-    else phrases.push(token);
+    if (text[i] === "#") {
+      i += 1;
+      const value = readValue();
+      if (value) out.tags.push(value);
+      continue;
+    }
+    const prefix = /^(is|dir|model):/i.exec(text.slice(i));
+    if (prefix) {
+      i += prefix[0].length;
+      const value = readValue().trim();
+      if (!value) continue; // bare "dir:" while typing — ignored
+      const key = prefix[1].toLowerCase();
+      if (key === "is") out.states.push(value);
+      else if (key === "dir") out.dirs.push(value);
+      else out.models.push(value);
+      continue;
+    }
+    const value = readValue();
+    if (value) out.phrases.push(value);
   }
-  return { tags, states, phrases };
+  return out;
 }
 
 function composeFilterQuery(parts) {
+  const needsQuote = (value) => !/^[\w:/.-]+$/.test(value);
+  const prefixed = (prefix, value) => (needsQuote(value) ? `${prefix}"${value}"` : `${prefix}${value}`);
   return [
     ...parts.tags.map((tag) => `#${tag}`),
     ...parts.states.map((state) => `is:${state}`),
-    ...parts.phrases.map((phrase) => (/^[\w:/.-]+$/.test(phrase) ? phrase : `"${phrase}"`)),
+    ...parts.dirs.map((dir) => prefixed("dir:", dir)),
+    ...parts.models.map((model) => prefixed("model:", model)),
+    ...parts.phrases.map((phrase) => (needsQuote(phrase) ? `"${phrase}"` : phrase)),
   ].join(" ");
 }
 
@@ -3445,7 +3485,7 @@ class SessionsDashboard {
       this.filterInput = toolbar.createEl("input", {
         type: "search",
         cls: "opencode-sessions-cards-filter",
-        placeholder: "Filter: #tag, is:running, or text…",
+        placeholder: "Filter: #tag, is:state, dir:, model:, or title…",
       });
       this.filterInput.addEventListener("input", () => {
         this.filterQuery = parseFilterQuery(this.filterInput.value);
@@ -3586,8 +3626,10 @@ class SessionsDashboard {
 
   filteredSessions() {
     const widgetTags = this.widgetTagSet();
-    const { tags, states, phrases } = this.filterQuery;
-    if (!widgetTags && !tags.length && !states.length && !phrases.length) return this.sessions;
+    const { tags, states, dirs, models, phrases } = this.filterQuery;
+    const anyQuery =
+      widgetTags || tags.length || states.length || dirs.length || models.length || phrases.length;
+    if (!anyQuery) return this.sessions;
     return this.sessions.filter((session) => {
       if (widgetTags) {
         for (const tag of widgetTags) {
@@ -3600,20 +3642,31 @@ class SessionsDashboard {
       if (states.length && !states.includes(String(session.state || "").toLowerCase())) {
         return false;
       }
-      if (phrases.length) {
+      if (dirs.length) {
+        const blob = [session.directoryLabel, session.directory]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        for (const dir of dirs) {
+          if (!blob.includes(dir.toLowerCase())) return false;
+        }
+      }
+      if (models.length) {
         const blob = [
-          session.titleLabel,
-          session.stateLabel,
-          session.directoryLabel,
           session.modelLabel,
-          session.agent,
-          session.id,
+          typeof session.model === "string" ? session.model : "",
         ]
           .filter(Boolean)
           .join(" ")
           .toLowerCase();
+        for (const model of models) {
+          if (!blob.includes(model.toLowerCase())) return false;
+        }
+      }
+      if (phrases.length) {
+        const title = String(session.titleLabel || "").toLowerCase();
         for (const phrase of phrases) {
-          if (!blob.includes(phrase.toLowerCase())) return false;
+          if (!title.includes(phrase.toLowerCase())) return false;
         }
       }
       return true;
@@ -3669,14 +3722,18 @@ class SessionsDashboard {
   // ----- filtering -------------------------------------------------------------
 
   // Toggles one criterion in the query and rewrites the input to match —
-  // the string stays the single source of truth. kind: "tag" | "state" | "phrase".
+  // the string stays the single source of truth.
+  // kind: "tag" | "state" | "dir" | "model" | "phrase".
   toggleFilter(kind, value) {
+    const keys = { tag: "tags", state: "states", dir: "dirs", model: "models", phrase: "phrases" };
     const parts = {
       tags: [...this.filterQuery.tags],
       states: [...this.filterQuery.states],
+      dirs: [...this.filterQuery.dirs],
+      models: [...this.filterQuery.models],
       phrases: [...this.filterQuery.phrases],
     };
-    const list = kind === "tag" ? parts.tags : kind === "state" ? parts.states : parts.phrases;
+    const list = parts[keys[kind] || "phrases"];
     const key = value.toLowerCase();
     const index = list.findIndex((entry) => entry.toLowerCase() === key);
     if (index >= 0) list.splice(index, 1);
@@ -3779,9 +3836,9 @@ class SessionsDashboard {
       );
     }
 
-    // Model / Directory: label phrases (quoted in the query when they
-    // contain spaces).
-    const labelGroup = (label, field) => {
+    // Model / Directory: prefixed criteria (model: / dir:), values quoted in
+    // the query when they contain spaces.
+    const labelGroup = (label, field, kind) => {
       const counts = new Map();
       for (const session of this.sessions) {
         const value = String(session[field] || "").trim();
@@ -3790,20 +3847,22 @@ class SessionsDashboard {
       }
       if (!counts.size) return null;
       const chips = group(label);
-      const activePhrases = new Set(this.filterQuery.phrases.map((phrase) => phrase.toLowerCase()));
+      const activeValues = new Set(
+        this.filterQuery[kind === "model" ? "models" : "dirs"].map((value) => value.toLowerCase()),
+      );
       for (const [value, count] of [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)) {
         chip(
           chips,
           value,
-          activePhrases.has(value.toLowerCase()),
+          activeValues.has(value.toLowerCase()),
           count,
-          () => this.toggleFilter("phrase", value),
+          () => this.toggleFilter(kind, value),
         );
       }
       return chips;
     };
-    labelGroup("Model", "modelLabel");
-    labelGroup("Directory", "directoryLabel");
+    labelGroup("Model", "modelLabel", "model");
+    labelGroup("Directory", "directoryLabel", "dir");
   }
 
   // The vault note attached to this session, if any (frontmatter index).
