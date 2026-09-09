@@ -412,11 +412,103 @@
   font-size: var(--font-smaller);
 }
 
+.oc-icon-button.oc-active {
+  color: var(--text-accent);
+  background: color-mix(in srgb, var(--interactive-accent) 16%, transparent);
+}
+
 .oc-meta {
   margin-top: 0.25rem;
   font-size: var(--font-smaller);
   color: var(--text-muted);
   overflow-wrap: anywhere;
+}
+
+/* ----- session notes side panel (chat | notes split) ---------------------- */
+
+/* With the notes panel open the view becomes a row: chat column (oc-main,
+ * everything the view had before) + notes column. */
+.opencode-session-view.has-notes {
+  flex-direction: row;
+}
+
+.oc-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.oc-notes {
+  flex: 0 0 22rem;
+  min-width: 15rem;
+  max-width: 45%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin-left: 0.9rem;
+  padding-left: 0.9rem;
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+.oc-notes-header {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding-bottom: 0.4rem;
+  margin-bottom: 0.5rem;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.oc-notes-title {
+  flex: 1 1 auto;
+  font-size: var(--font-smaller);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.oc-notes-actions {
+  display: flex;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+.oc-notes-area {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 6rem;
+  resize: none;
+  font-family: var(--font-text);
+  line-height: 1.45;
+}
+
+.oc-notes-status {
+  flex: 0 0 auto;
+  padding-top: 0.35rem;
+  font-size: var(--font-smallest);
+  color: var(--text-faint);
+}
+
+.oc-notes-empty,
+.oc-notes-loading {
+  color: var(--text-muted);
+  font-size: var(--font-smaller);
+  padding: 0.75rem 0.25rem;
+}
+
+.oc-notes-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.6rem;
+}
+
+.oc-notes-empty-hint {
+  color: var(--text-faint);
+  font-size: var(--font-smallest);
 }
 
 .oc-offline {

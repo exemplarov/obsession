@@ -1,7 +1,7 @@
 {
   "id": "vibed",
   "name": "Vibed",
-  "version": "0.9.2",
+  "version": "0.10.0",
   "minAppVersion": "1.4.0",
   "description": "Browse agent sessions (OpenCode v2/v1, Claude Code, Codex, Cursor): dedicated view or dashboards embedded in any note. Live streaming and chat for OpenCode, read-only transcripts for the rest.",
   "author": "Roman Exemplarov",

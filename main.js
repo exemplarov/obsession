@@ -13,6 +13,9 @@ const BLOCK_LANGUAGE = "vibed";
 const DEFAULT_REFRESH_SECONDS = 30;
 const DEFAULT_PAGE_SIZE = 10;
 const DEFAULT_MESSAGE_PAGE = 100;
+const DEFAULT_NOTES_DIR = "vibed-notes";
+// Notes autosave debounce: typing pauses of less than this don't hit the disk.
+const NOTES_SAVE_DEBOUNCE_MS = 600;
 // A session counts as "running" only if its last assistant message started
 // streaming recently; older uncompleted messages are sessions killed mid-reply.
 // Only used when the v2 API event stream is unavailable (SQLite fallback).
@@ -161,12 +164,25 @@ function dedupeConnectorNames(connectors) {
 // Settings schema v2 (named connectors). A store without a `connectors`
 // array is a fresh install: create the zero-config local OpenCode v2
 // connector, scoped to the vault (listing needs a directory scope).
+// Vault folder for session notes, as a vault-relative path ("vibed-notes").
+// Empty input restores the default; absolute prefixes and trailing slashes
+// are stripped so the value is always a clean relative folder.
+function normalizeNotesDir(value) {
+  const cleaned = String(value || "")
+    .replace(/^[\\/]+/, "")
+    .replace(/[\\/]+$/, "")
+    .trim();
+  return cleaned || DEFAULT_NOTES_DIR;
+}
+
 function normalizeSettings(saved, vaultRoot) {
   const pageSize =
     Number.isFinite(saved.pageSize) && saved.pageSize > 0 ? saved.pageSize : DEFAULT_PAGE_SIZE;
   const refreshSeconds = Number.isFinite(saved.refreshSeconds)
     ? saved.refreshSeconds
     : DEFAULT_REFRESH_SECONDS;
+  const notesDir =
+    typeof saved.notesDir === "string" ? normalizeNotesDir(saved.notesDir) : DEFAULT_NOTES_DIR;
   let connectors = Array.isArray(saved.connectors) ? saved.connectors.map(normalizeConnector) : null;
   if (!connectors) {
     const config = CONNECTOR_KINDS.opencode2.createConfig();
@@ -189,6 +205,7 @@ function normalizeSettings(saved, vaultRoot) {
       : connectors[0]?.id || "",
     pageSize,
     refreshSeconds,
+    notesDir,
     connectors,
   };
 }
@@ -272,6 +289,49 @@ function runSqlite(sqlitePath, databasePath, sql) {
 // table matches both backends' encodings.
 function slugifyPath(directory) {
   return String(directory || "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+// ---------------------------------------------------------------------------
+// Session-note helpers. Notes are ordinary vault markdown files attached to
+// a session via a `session:` frontmatter key — never via the filename — so
+// they survive renames and moves anywhere in the vault.
+// ---------------------------------------------------------------------------
+
+// Obsidian forbids these in filenames (and #^[] break wikilinks even when
+// the filesystem allows them).
+function sanitizeNoteName(title) {
+  const cleaned = String(title || "")
+    .replace(/["*\\/:<>?|#^[\]\x00-\x1f]+/g, " ")
+    .replace(/\s+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-.\s]+|[-.\s]+$/g, "")
+    .slice(0, 80);
+  return cleaned || "untitled";
+}
+
+// Splits a note into its raw frontmatter block (between the --- markers) and
+// the body. Files without frontmatter return null — the caller only ever
+// rewrites files it found through the frontmatter index, so this is just a
+// corruption guard.
+function splitNoteFrontmatter(text) {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(String(text || ""));
+  if (!match) return null;
+  return { frontmatter: match[1], body: text.slice(match[0].length) };
+}
+
+function buildNoteContent(fields) {
+  // JSON.stringify doubles as YAML double-quoting for free-form values
+  // (names/titles may contain ":" or "#", which would break bare YAML).
+  const lines = [
+    "---",
+    `session: ${JSON.stringify(String(fields.sessionId))}`,
+    `connector: ${JSON.stringify(String(fields.connectorName || ""))}`,
+    `title: ${JSON.stringify(String(fields.title || ""))}`,
+    `created: ${new Date().toISOString()}`,
+    "---",
+    "",
+  ];
+  return lines.join("\n");
 }
 
 function trimSlugEdges(value) {
@@ -3020,6 +3080,119 @@ class ConnectorRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Session notes. One ordinary markdown file per session, attached via a
+// `session:` frontmatter id — never via the filename, so notes survive
+// renames and moves anywhere in the vault. Lookup rides on Obsidian's
+// metadataCache (frontmatter is already parsed in memory): one index pass
+// at startup, then incremental updates from cache events. Works for every
+// connector — notes live in the vault, not in the backend.
+// ---------------------------------------------------------------------------
+
+class SessionNotes {
+  constructor(plugin) {
+    this.plugin = plugin;
+    // sessionId -> TFile (lookup) and TFile -> sessionId (bookkeeping, so a
+    // frontmatter edit removes the stale mapping without a full rebuild).
+    this.bySession = new Map();
+    this.sessionByFile = new Map();
+  }
+
+  // Accepts the `session` frontmatter value in its YAML-decoded form.
+  static sessionKeyOf(frontmatter) {
+    const value = frontmatter?.session;
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number") return String(value);
+    return null;
+  }
+
+  // Startup / metadata-resolved pass. Cheap: reads only cached metadata,
+  // never touches the disk.
+  buildIndex() {
+    this.bySession.clear();
+    this.sessionByFile.clear();
+    for (const file of this.app.vault.getMarkdownFiles()) this.indexFile(file);
+  }
+
+  // Upsert one file's index entry from its (possibly just-changed) cache.
+  indexFile(file) {
+    const previous = this.sessionByFile.get(file);
+    let id = null;
+    try {
+      id = SessionNotes.sessionKeyOf(this.app.metadataCache.getFileCache(file)?.frontmatter);
+    } catch {
+      id = null;
+    }
+    if (!id) {
+      if (previous) {
+        this.sessionByFile.delete(file);
+        if (this.bySession.get(previous) === file) this.bySession.delete(previous);
+      }
+      return null;
+    }
+    if (previous && previous !== id && this.bySession.get(previous) === file) {
+      this.bySession.delete(previous);
+    }
+    this.bySession.set(id, file);
+    this.sessionByFile.set(file, id);
+    return id;
+  }
+
+  unindexFile(file) {
+    const id = this.sessionByFile.get(file);
+    if (!id) return;
+    this.sessionByFile.delete(file);
+    if (this.bySession.get(id) === file) this.bySession.delete(id);
+  }
+
+  // Renames mutate the TFile in place, so both maps stay valid — nothing to do.
+
+  find(sessionId) {
+    return this.bySession.get(sessionId) || null;
+  }
+
+  // Returns the existing note for the session, or creates one in the notes
+  // folder as `<session-id>-<title>.md`. Filename collisions get a numeric
+  // suffix; the index is authoritative, so this is cosmetic only.
+  async ensureNote(sessionId, meta = {}) {
+    const existing = this.find(sessionId);
+    if (existing) return existing;
+    const folder = this.plugin.settings.notesDir;
+    try {
+      await this.app.vault.createFolder(folder);
+    } catch {
+      // Already exists — the happy path.
+    }
+    const base = `${sessionId}-${sanitizeNoteName(meta.title)}`;
+    for (let attempt = 1; ; attempt += 1) {
+      if (attempt > 26) throw new Error("could not find a free note filename");
+      const name = attempt === 1 ? base : `${base}-${attempt}`;
+      const notePath = `${folder}/${name}.md`;
+      if (this.app.vault.getAbstractFileByPath(notePath)) continue;
+      const content = buildNoteContent({
+        sessionId,
+        connectorName: meta.connectorName || "",
+        title: meta.title || "",
+      });
+      try {
+        const file = await this.app.vault.create(notePath, content);
+        // The metadata cache may not have parsed the new file yet; seed the
+        // index directly so an immediate reopen finds it.
+        this.bySession.set(sessionId, file);
+        this.sessionByFile.set(file, sessionId);
+        return file;
+      } catch (error) {
+        if (attempt > 25) throw error;
+        // Raced with a concurrent create — retry with the next suffix.
+      }
+    }
+  }
+
+  get app() {
+    return this.plugin.app;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Dashboard (session list) — same renderer for the dedicated view and for
 // ```vibed blocks embedded in notes.
 // ---------------------------------------------------------------------------
@@ -3441,6 +3614,18 @@ class SessionChatView extends ItemView {
     this.questionAnswers = new Map();
     this.lastLoadedAt = 0;
     this.refreshing = false;
+    // Session notes panel: file binding + debounced autosave bookkeeping.
+    this.notesOpen = false;
+    this.notesPanelEl = null;
+    this.noteFile = null;
+    this.noteFrontmatter = null;
+    this.noteArea = null;
+    this.noteStatusEl = null;
+    this.noteSaveTimer = null;
+    this.noteSavePending = false;
+    this.noteBody = "";
+    this.noteLoadedFor = null;
+    this.noteSeq = 0;
   }
 
   getViewType() {
@@ -3488,6 +3673,7 @@ class SessionChatView extends ItemView {
       draftDirectory: this.draftDirectory,
       connectorId: this.connectorId || this.connector?.id || null,
       connectorName: this.connectorName || this.connector?.name || null,
+      notesOpen: this.notesOpen,
     };
   }
 
@@ -3498,6 +3684,9 @@ class SessionChatView extends ItemView {
       }
       if (typeof state.connectorName === "string" && state.connectorName && !this.connectorName) {
         this.connectorName = state.connectorName;
+      }
+      if (typeof state.notesOpen === "boolean") {
+        this.notesOpen = state.notesOpen;
       }
       if (typeof state.sessionId === "string" && state.sessionId) {
         if (!this.sessionId) this.sessionId = state.sessionId;
@@ -3583,6 +3772,12 @@ class SessionChatView extends ItemView {
 
   async onClose() {
     this.unsubscribed = true;
+    // Flush an in-flight note edit: the debounce may have a keystroke left.
+    if (this.noteSaveTimer) {
+      window.clearTimeout(this.noteSaveTimer);
+      this.noteSaveTimer = null;
+      this.saveNoteNow().catch(() => {});
+    }
     if (this.unsubscribeEvents) this.unsubscribeEvents();
     if (this.unsubscribeStream) this.unsubscribeStream();
     if (this.filePollTimer) {
@@ -3594,7 +3789,10 @@ class SessionChatView extends ItemView {
 
   buildSkeleton() {
     const { contentEl } = this;
-    const header = contentEl.createDiv({ cls: "oc-header" });
+    // Side-by-side layout: the chat column (everything below) plus an
+    // optional notes panel (created on demand at contentEl level).
+    const main = contentEl.createDiv({ cls: "oc-main" });
+    const header = main.createDiv({ cls: "oc-header" });
     const titleRow = header.createDiv({ cls: "oc-header-row" });
     this.backButton = titleRow.createEl("button", {
       cls: "oc-icon-button oc-back",
@@ -3618,17 +3816,47 @@ class SessionChatView extends ItemView {
         .then(() => new Notice("Copied session ID"))
         .catch(() => new Notice(this.sessionId));
     });
+    this.notesButton = titleRow.createEl("button", {
+      cls: "oc-icon-button oc-notes-toggle",
+      attr: { "aria-label": "Session notes" },
+    });
+    setIcon(this.notesButton, "sticky-note");
+    this.notesButton.style.display = "none";
+    this.notesButton.addEventListener("click", () => this.toggleNotes());
     this.refreshButton = titleRow.createEl("button", { cls: "oc-icon-button oc-refresh", text: "Refresh" });
     this.refreshButton.addEventListener("click", () => this.refresh(true));
     this.metaEl = header.createDiv({ cls: "oc-meta", text: "Loading…" });
     this.offlineEl = header.createDiv({ cls: "oc-offline", text: "" });
     this.offlineEl.style.display = "none";
 
+    // External note edits (made in the editor or another pane) sync into an
+    // open notes panel — but never clobber text being typed or a pending save.
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => this.syncNoteFromOutside(file)),
+    );
+    // The panel may have opened before the metadata index finished (startup
+    // restore) or the note may appear later (created elsewhere) — re-resolve
+    // when the index catches up. Cheap: guarded to noteless open panels.
+    this.registerEvent(
+      this.app.metadataCache.on("resolved", () => {
+        if (this.notesOpen && !this.noteFile && !this.unsubscribed) {
+          this.loadNote().catch(() => {});
+        }
+      }),
+    );
+    this.registerEvent(
+      this.app.vault.on("create", () => {
+        if (this.notesOpen && !this.noteFile && !this.noteSavePending && !this.unsubscribed) {
+          this.loadNote().catch(() => {});
+        }
+      }),
+    );
+
     // The chat trick: column-reverse keeps content attached to the bottom.
     // Newest message = FIRST DOM child (visual bottom); scrollTop 0 is the
     // bottom, so streaming growth stays pinned to the latest content without
     // any scroll juggling. "Load older" sits LAST (visual top).
-    this.chatEl = contentEl.createDiv({ cls: "oc-chat" });
+    this.chatEl = main.createDiv({ cls: "oc-chat" });
     this.olderButton = this.chatEl.createEl("button", {
       cls: "oc-load-older",
       text: "Load older messages",
@@ -3648,15 +3876,15 @@ class SessionChatView extends ItemView {
     // Permission approval banner: sits between the transcript and the
     // composer so a pending approval is always visible (the chat is
     // bottom-anchored, a banner inside the stream could scroll away).
-    this.permissionEl = contentEl.createDiv({ cls: "oc-permission" });
+    this.permissionEl = main.createDiv({ cls: "oc-permission" });
     this.permissionEl.style.display = "none";
 
     // Agent question banner: same placement rationale — the session is
     // paused until the batch is answered or dismissed.
-    this.questionEl = contentEl.createDiv({ cls: "oc-question" });
+    this.questionEl = main.createDiv({ cls: "oc-question" });
     this.questionEl.style.display = "none";
 
-    const composer = contentEl.createDiv({ cls: "oc-composer" });
+    const composer = main.createDiv({ cls: "oc-composer" });
     const caps = this.driverCapabilities();
     this.readOnly = !caps.chat;
     if (this.readOnly) {
@@ -3807,6 +4035,7 @@ class SessionChatView extends ItemView {
   }
 
   renderHeader() {
+    this.updateNotesChrome();
     const defaultName = this.plugin.registry?.defaultConnector()?.connector.name;
     const chipName = this.connector && this.connector.name !== defaultName ? this.connector.name : "";
     if (this.connectorChipEl) {
@@ -3844,6 +4073,201 @@ class SessionChatView extends ItemView {
         .filter(Boolean)
         .join(" · "),
     );
+  }
+
+  // ----- session notes ---------------------------------------------------------
+
+  // Notes attachment is vault-side, so it works for every connector. The
+  // toggle exists only for bound sessions (drafts have no id yet).
+  updateNotesChrome() {
+    if (!this.notesButton) return;
+    this.notesButton.style.display = this.sessionId ? "" : "none";
+    this.notesButton.classList.toggle("oc-active", this.notesOpen && !!this.noteFile);
+    this.notesButton.title = this.noteFile ? this.noteFile.path : "Session notes";
+    // Deferred open: notesOpen was set before a session was bound (draft
+    // promotion, workspace restore) — build the panel now that there is one.
+    if (this.sessionId && this.notesOpen && !this.notesPanelEl && this.contentEl) {
+      this.renderNotes();
+    }
+  }
+
+  toggleNotes() {
+    if (this.notesOpen && this.noteSaveTimer) {
+      // Flush before tearing the textarea out of the DOM.
+      window.clearTimeout(this.noteSaveTimer);
+      this.noteSaveTimer = null;
+      this.saveNoteNow().catch(() => {});
+    }
+    this.notesOpen = !this.notesOpen;
+    this.renderNotes();
+  }
+
+  // Idempotent panel render from current state; async state changes funnel
+  // through loadNote() and re-render here. Never rebuilt while the textarea
+  // is focused (external sync is guarded), so typing is never clobbered.
+  // NOTE: the panel element is created/removed BEFORE updateNotesChrome() —
+  // its deferred-open path calls back into renderNotes and relies on
+  // notesPanelEl already existing (or notesOpen being false).
+  renderNotes() {
+    if (!this.notesOpen || !this.sessionId) {
+      this.teardownNotesPanel();
+      this.updateNotesChrome();
+      return;
+    }
+    if (!this.notesPanelEl) this.notesPanelEl = this.contentEl.createDiv({ cls: "oc-notes" });
+    this.updateNotesChrome();
+    this.contentEl.addClass("has-notes");
+    this.notesPanelEl.empty();
+    this.noteArea = null;
+    this.noteStatusEl = null;
+    const header = this.notesPanelEl.createDiv({ cls: "oc-notes-header" });
+    header.createSpan({ cls: "oc-notes-title", text: "Session note" });
+    const actions = header.createDiv({ cls: "oc-notes-actions" });
+    if (this.noteFile) {
+      const openButton = actions.createEl("button", {
+        cls: "oc-icon-button",
+        attr: { "aria-label": "Open in editor", title: "Open in editor" },
+      });
+      setIcon(openButton, "arrow-up-right");
+      openButton.addEventListener("click", () => this.openNoteInEditor());
+    }
+    const closeButton = actions.createEl("button", {
+      cls: "oc-icon-button",
+      attr: { "aria-label": "Close notes" },
+    });
+    setIcon(closeButton, "x");
+    closeButton.addEventListener("click", () => this.toggleNotes());
+
+    if (!this.noteFile) {
+      const empty = this.notesPanelEl.createDiv({ cls: "oc-notes-empty" });
+      if (this.noteLoadedFor !== this.sessionId) {
+        empty.createDiv({ cls: "oc-notes-loading", text: "Looking for a note…" });
+        this.loadNote().catch(() => {});
+        return;
+      }
+      empty.createDiv({ text: "No note attached to this session yet." });
+      empty.createDiv({
+        cls: "oc-notes-empty-hint",
+        text: `Creates a markdown file in ${this.plugin.settings.notesDir}/ with this session's id in its frontmatter — a normal vault note, linkable and searchable.`,
+      });
+      const createButton = empty.createEl("button", { cls: "mod-cta", text: "Create note" });
+      createButton.addEventListener("click", () => this.createNote());
+      return;
+    }
+
+    this.noteArea = this.notesPanelEl.createEl("textarea", {
+      cls: "oc-notes-area",
+      attr: { placeholder: "Notes for this session… (frontmatter is preserved)", spellcheck: "false" },
+    });
+    this.noteArea.value = this.noteBody;
+    this.noteArea.addEventListener("input", () => this.scheduleNoteSave());
+    this.noteStatusEl = this.notesPanelEl.createSpan({
+      cls: "oc-notes-status",
+      text: this.noteSavePending ? "Edited…" : "",
+    });
+  }
+
+  teardownNotesPanel() {
+    this.notesPanelEl?.remove();
+    this.notesPanelEl = null;
+    this.noteArea = null;
+    this.noteStatusEl = null;
+    this.contentEl?.removeClass("has-notes");
+  }
+
+  // Resolves the session's note from the frontmatter index. A file whose
+  // `session:` frontmatter was removed is no longer attached — treated as
+  // missing rather than silently re-attached.
+  async loadNote() {
+    if (!this.sessionId || this.unsubscribed) return;
+    const seq = ++this.noteSeq;
+    let file = null;
+    let frontmatter = null;
+    let body = "";
+    const indexed = this.plugin.notes ? this.plugin.notes.find(this.sessionId) : null;
+    if (indexed) {
+      try {
+        const text = await this.app.vault.read(indexed);
+        const split = splitNoteFrontmatter(text);
+        if (split) {
+          file = indexed;
+          frontmatter = split.frontmatter;
+          body = split.body;
+        }
+      } catch {
+        // Unreadable note behaves like a missing one; next open retries.
+      }
+    }
+    if (seq !== this.noteSeq || this.unsubscribed) return;
+    this.noteFile = file;
+    this.noteFrontmatter = frontmatter;
+    this.noteBody = body;
+    this.noteLoadedFor = this.sessionId;
+    this.renderNotes();
+  }
+
+  async createNote() {
+    if (!this.sessionId || !this.plugin.notes) return;
+    try {
+      await this.plugin.notes.ensureNote(this.sessionId, {
+        title: this.session?.title || this.titleEl?.getText() || "",
+        connectorName: this.connector?.name || "",
+      });
+      this.noteLoadedFor = null;
+      await this.loadNote();
+      this.noteArea?.focus();
+    } catch (error) {
+      new Notice(`Could not create note: ${error.message}`);
+    }
+  }
+
+  scheduleNoteSave() {
+    this.noteSavePending = true;
+    if (this.noteStatusEl) this.noteStatusEl.setText("Edited…");
+    if (this.noteSaveTimer) window.clearTimeout(this.noteSaveTimer);
+    this.noteSaveTimer = window.setTimeout(() => {
+      this.noteSaveTimer = null;
+      this.saveNoteNow().catch(() => {});
+    }, NOTES_SAVE_DEBOUNCE_MS);
+  }
+
+  // Rewrites the file with the ORIGINAL frontmatter block (user-added
+  // properties survive) and the edited body.
+  async saveNoteNow() {
+    if (!this.noteFile || !this.noteArea || !this.noteSavePending || !this.noteFrontmatter) return;
+    const content = `---\n${this.noteFrontmatter}\n---\n${this.noteArea.value}`;
+    if (this.noteStatusEl) this.noteStatusEl.setText("Saving…");
+    try {
+      await this.app.vault.modify(this.noteFile, content);
+      this.noteSavePending = false;
+      this.noteBody = this.noteArea.value;
+      if (this.noteStatusEl) this.noteStatusEl.setText("Saved");
+    } catch (error) {
+      if (this.noteStatusEl) this.noteStatusEl.setText(`Save failed: ${error.message}`);
+    }
+  }
+
+  // External edits (editor, another pane) sync into an open panel — but
+  // never clobber typing or a pending autosave of our own.
+  syncNoteFromOutside(file) {
+    if (!this.notesOpen || this.unsubscribed) return;
+    if (this.noteSavePending || document.activeElement === this.noteArea) return;
+    if (file !== this.noteFile) return;
+    this.loadNote().catch(() => {});
+  }
+
+  // Called by the plugin after the notes index is (re)built — a panel that
+  // rendered before the index was warm must not sit on a false "no note".
+  refreshNoteBinding() {
+    if (!this.unsubscribed && this.notesOpen && !this.noteFile && !this.noteSavePending) {
+      this.loadNote().catch(() => {});
+    }
+  }
+
+  async openNoteInEditor() {
+    if (!this.noteFile) return;
+    const leaf = this.app.workspace.getLeaf("split");
+    await leaf.openFile(this.noteFile);
   }
 
   async loadInitial() {
@@ -5339,6 +5763,21 @@ class OpenCodeSessionsSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Session notes folder")
+      .setDesc(
+        "Vault folder for per-session notes (toggled from a chat's header). Notes are ordinary markdown files attached by a session: frontmatter id — rename or move them freely. Empty restores vibed-notes.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_NOTES_DIR)
+          .setValue(this.plugin.settings.notesDir)
+          .onChange(async (value) => {
+            this.plugin.settings.notesDir = normalizeNotesDir(value);
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
       .setName("Open dashboard")
       .setDesc("Open the sessions table in a new Obsidian tab.")
       .addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.activateView()));
@@ -5740,6 +6179,23 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     this.registry = new ConnectorRegistry(this);
     this.registry.init();
 
+    // Session notes: index frontmatter `session:` ids over Obsidian's
+    // metadata cache. "changed" fires on every cache update (create, edit,
+    // frontmatter change) — the index never needs a disk pass after startup.
+    this.notes = new SessionNotes(this);
+    this.registerEvent(this.app.metadataCache.on("changed", (file) => this.notes.indexFile(file)));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.notes.unindexFile(file)));
+    this.registerEvent(
+      this.app.metadataCache.on("resolved", () => {
+        this.notes.buildIndex();
+        this.refreshNoteBindings();
+      }),
+    );
+    this.app.workspace.onLayoutReady(() => {
+      this.notes.buildIndex();
+      this.refreshNoteBindings();
+    });
+
     this.api = {
       apiVersion: 4,
       // Per-connector namespace: api.connector("claude").list({}) …
@@ -5796,6 +6252,14 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
         defaultConnector: this.registry.defaultConnector()?.connector.name || null,
       }),
       open: (ref) => this.openSession(ref),
+      // Vault-side session notes: find(sessionId) -> { path } | null.
+      notes: {
+        find: (sessionId) => {
+          const file = this.notes?.find(sessionId);
+          return file ? { path: file.path, basename: file.basename } : null;
+        },
+        folder: () => this.settings.notesDir,
+      },
       server: {
         connected: () => this.serverEvents?.connected || false,
         health: () => {
@@ -5944,6 +6408,15 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
       } catch (error) {
         console.error("OpenCode Sessions listener failed:", error);
       }
+    }
+  }
+
+  // After the notes index is (re)built, open chat panels that rendered
+  // against an empty index re-resolve their note binding.
+  refreshNoteBindings() {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_SESSION)) {
+      const view = leaf.view;
+      if (view instanceof SessionChatView) view.refreshNoteBinding();
     }
   }
 

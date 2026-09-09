@@ -13,7 +13,7 @@ v2 remains the first-class citizen; everything else is a read-only companion.
 
 ![A session dashboard embedded in a note: live session card with a Running… badge, filter, and refresh](images/note-dashboard.png)
 
-![version](https://img.shields.io/badge/version-0.9.2-blue)
+![version](https://img.shields.io/badge/version-0.10.0-blue)
 
 ## Connectors
 
@@ -71,6 +71,7 @@ seconds. Very large transcripts (>128 MB) are refused with a clear message.
 - **Approvals**: permission banners with Allow / Always allow / Reject, synced with replies made anywhere (TUI, other tabs).
 - **Agent questions**: answer the agent's `question` tool inline — options (single/multi-select), yes/no, or custom text — or dismiss it; synced with answers made anywhere. Works across both server generations (form and question APIs).
 - **Offline fallback**: when the server is down, v2 chats show the conversation read-only from `session_v2`/`session_message`.
+- **Session notes**: attach a markdown note to any session (every connector) — a side panel in the chat view with autosave, backed by a normal vault file found by `session:` frontmatter, not filename. See [Session notes](#session-notes).
 - Also exposes an API (`globalThis.vibed`) for e.g. Datacore JSX consumers.
 
 ## Screenshots
@@ -146,10 +147,40 @@ Markdown links open the chat tab for a session:
 in `api.open("claude:<uuid>")`). Bare ids resolve against the default
 connector.
 
+## Session notes
+
+Every session chat has a notes toggle (the sticky-note button in the header).
+It opens a side panel next to the transcript: click **Create note** and type —
+edits autosave (600 ms debounce); *Open in editor* hands the note to the
+normal markdown editor. Notes work for **all** connectors, including the
+read-only ones.
+
+Notes are ordinary vault files. The attachment is a frontmatter id — never
+the filename — so you can rename or move them anywhere in the vault and they
+stay attached (the plugin looks them up through Obsidian's metadata cache):
+
+```markdown
+---
+session: ses_abc123def456
+connector: opencode
+title: "Refactor the export pipeline"
+created: 2026-09-09T12:00:00.000Z
+---
+
+Context, decisions, follow-ups…
+```
+
+By default notes are created in `vibed-notes/` at the vault root as
+`<session-id>-<title>.md` — change the folder in **Settings → General →
+Session notes folder**. The panel hides the frontmatter (but preserves it and
+any properties you add on save). Editing the note elsewhere syncs back into
+an open panel; a note whose `session:` frontmatter you remove simply reads as
+*not attached*.
+
 ## Settings
 
 **General** — default connector, items per page, refresh interval (seconds;
-`0` disables the timer).
+`0` disables the timer), session notes folder (default `vibed-notes`).
 
 **Connectors** — one card per connector: editable name, enable toggle,
 health status, duplicate/delete, and per-kind fields:
@@ -170,7 +201,9 @@ transparency, it does access:
 - **Files outside your vaults** (read-only): OpenCode v2/v1
   `~/.local/share/opencode/opencode.db`, Claude Code `~/.claude/projects/`,
   Codex `~/.codex/sessions/`, Cursor `~/.cursor/projects/` — that's where the
-  agent histories live. Nothing outside your vault is modified.
+  agent histories live. Nothing outside your vault is modified. The only
+  thing written anywhere: session notes you explicitly create, inside your
+  vault (see [Session notes](#session-notes)).
 - **Local network**: the auto-discovered OpenCode v2 server
   (`~/.local/state/opencode/service.json`) for live streaming, chat, prompts,
   and approvals. With a remote *Server URL override*, the plugin talks to that
@@ -205,6 +238,8 @@ const rows = await claude.list({ dirs: ["/abs/path"] });
 await claude.messages("<uuid>", { limit: 100, order: "asc" });
 const unsubscribe = api.subscribe(() => {});
 api.config();
+api.notes.find("ses_…");             // { path, basename } | null — note attached by frontmatter
+api.notes.folder();                  // configured notes folder ("vibed-notes")
 api.open("claude:<uuid>");           // also "ses_…" (default connector)
 await api.server.health();           // v2-only namespace
 await api.server.messages("ses_…", { limit: 100, order: "asc" });
