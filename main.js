@@ -3114,8 +3114,10 @@ class SessionNotes {
   }
 
   // Upsert one file's index entry from its (possibly just-changed) cache.
+  // Returns true only when the id → file mapping actually changed ( callers
+  // use it to refresh dashboards; plain body edits must not).
   indexFile(file) {
-    const previous = this.sessionByFile.get(file);
+    const previousId = this.sessionByFile.get(file) || null;
     let id = null;
     try {
       id = SessionNotes.sessionKeyOf(this.app.metadataCache.getFileCache(file)?.frontmatter);
@@ -3123,25 +3125,27 @@ class SessionNotes {
       id = null;
     }
     if (!id) {
-      if (previous) {
-        this.sessionByFile.delete(file);
-        if (this.bySession.get(previous) === file) this.bySession.delete(previous);
-      }
-      return null;
+      if (!previousId) return false;
+      this.sessionByFile.delete(file);
+      if (this.bySession.get(previousId) === file) this.bySession.delete(previousId);
+      return true;
     }
-    if (previous && previous !== id && this.bySession.get(previous) === file) {
-      this.bySession.delete(previous);
+    if (previousId === id && this.bySession.get(id) === file) return false;
+    if (previousId && previousId !== id && this.bySession.get(previousId) === file) {
+      this.bySession.delete(previousId);
     }
     this.bySession.set(id, file);
     this.sessionByFile.set(file, id);
-    return id;
+    return true;
   }
 
+  // Returns true when a mapping was actually removed.
   unindexFile(file) {
     const id = this.sessionByFile.get(file);
-    if (!id) return;
+    if (!id) return false;
     this.sessionByFile.delete(file);
     if (this.bySession.get(id) === file) this.bySession.delete(id);
+    return true;
   }
 
   // Renames mutate the TFile in place, so both maps stay valid — nothing to do.
@@ -3176,9 +3180,11 @@ class SessionNotes {
       try {
         const file = await this.app.vault.create(notePath, content);
         // The metadata cache may not have parsed the new file yet; seed the
-        // index directly so an immediate reopen finds it.
+        // index directly so an immediate reopen finds it, and let dashboards
+        // know an attachment appeared.
         this.bySession.set(sessionId, file);
         this.sessionByFile.set(file, sessionId);
+        this.plugin.scheduleListRefresh();
         return file;
       } catch (error) {
         if (attempt > 25) throw error;
@@ -3453,6 +3459,30 @@ class SessionsDashboard {
       .catch(() => new Notice(sessionId));
   }
 
+  // The vault note attached to this session, if any (frontmatter index).
+  sessionNoteFile(session) {
+    return this.plugin.notes?.find(session.id) || null;
+  }
+
+  openSessionNote(file) {
+    const leaf = this.plugin.app.workspace.getLeaf("tab");
+    leaf.openFile(file).catch(() => {});
+  }
+
+  noteButton(container, file) {
+    const button = container.createEl("button", {
+      cls: "opencode-sessions-note-button",
+      attr: { "aria-label": "Open session note" },
+    });
+    button.title = "Open session note";
+    setIcon(button, "sticky-note");
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.openSessionNote(file);
+    });
+    return button;
+  }
+
   renderCards(sessions) {
     for (const session of sessions) {
       const card = this.listEl.createDiv({
@@ -3467,7 +3497,10 @@ class SessionsDashboard {
         text: session.missing ? `${session.titleLabel} (not found)` : session.titleLabel,
       });
       title.title = "Open session";
-      head.createSpan({
+      const headRight = head.createDiv({ cls: "opencode-sessions-card-head-right" });
+      const noteFile = this.sessionNoteFile(session);
+      if (noteFile) this.noteButton(headRight, noteFile);
+      headRight.createSpan({
         cls: `opencode-sessions-badge opencode-sessions-badge-${session.state || "none"}`,
         text: session.stateLabel,
       });
@@ -3502,6 +3535,8 @@ class SessionsDashboard {
       );
       const title = row.createEl("td", { cls: "opencode-sessions-title", text: session.titleLabel });
       title.title = "Open session";
+      const noteFile = this.sessionNoteFile(session);
+      if (noteFile) this.noteButton(title, noteFile);
       row.createEl("td", {
         cls: `opencode-sessions-state opencode-sessions-state-${session.state || "none"}`,
         text: session.stateLabel,
@@ -6189,9 +6224,19 @@ module.exports = class OpenCodeSessionsPlugin extends Plugin {
     // Session notes: index frontmatter `session:` ids over Obsidian's
     // metadata cache. "changed" fires on every cache update (create, edit,
     // frontmatter change) — the index never needs a disk pass after startup.
+    // Real attachment changes refresh dashboards (note button appears);
+    // plain body edits don't (indexFile reports what actually changed).
     this.notes = new SessionNotes(this);
-    this.registerEvent(this.app.metadataCache.on("changed", (file) => this.notes.indexFile(file)));
-    this.registerEvent(this.app.vault.on("delete", (file) => this.notes.unindexFile(file)));
+    this.registerEvent(
+      this.app.metadataCache.on("changed", (file) => {
+        if (this.notes.indexFile(file)) this.scheduleListRefresh();
+      }),
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (this.notes.unindexFile(file)) this.scheduleListRefresh();
+      }),
+    );
     this.registerEvent(
       this.app.metadataCache.on("resolved", () => {
         this.notes.buildIndex();

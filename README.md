@@ -132,7 +132,7 @@ Options (simple `key: value` lines or a JSON object):
 | `pageSize` | plugin setting | Sessions per page. |
 | `title` | – | Optional heading above the dashboard. |
 
-Click a card (or table row) to open the live chat view; click a session ID to copy it.
+Click a card (or table row) to open the live chat view; click a session ID to copy it. Sessions with an attached note show a sticky-note button on their card / title cell — click it to open the note file.
 
 ## Linking to sessions
 
@@ -176,6 +176,10 @@ Session notes folder**. The panel hides the frontmatter (but preserves it and
 any properties you add on save). Editing the note elsewhere syncs back into
 an open panel; a note whose `session:` frontmatter you remove simply reads as
 *not attached*.
+
+Back in the session list, cards and table rows of noted sessions get a
+sticky-note button that opens the note file directly — it appears and
+disappears live as notes are created, renamed, or detached.
 
 ## Settings
 

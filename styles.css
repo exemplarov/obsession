@@ -152,6 +152,34 @@
   gap: 0.5rem;
 }
 
+.opencode-sessions-card-head-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-shrink: 0;
+}
+
+/* Icon button (cards + tables): opens the session's attached vault note. */
+.opencode-sessions-note-button {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.opencode-sessions-note-button:hover {
+  color: var(--text-accent);
+}
+
+.opencode-sessions-table .opencode-sessions-note-button {
+  margin-left: 0.35rem;
+  vertical-align: middle;
+}
+
 .opencode-sessions-card-title {
   font-weight: var(--font-bold);
 }
